@@ -5,6 +5,7 @@ import { google } from "googleapis";
 import { MercadoPagoConfig, Preference } from "mercadopago";
 import fetch from "node-fetch";
 import crypto from "crypto";
+import Stripe from "stripe";
 
 const app = express();
 
