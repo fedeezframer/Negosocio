@@ -1,16 +1,22 @@
 {
   "name": "negosocio",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "main": "api/server.js",
+  "description": "Software para Empresas - Sistema SaaS de gestión de turnos",
+  "author": "fedeezframer",
+  "license": "MIT",
   "scripts": {
-    "start": "node api/server.js"
+    "start": "node api/server.js",
+    "dev": "node --watch api/server.js",
+    "test": "node --test tests/**/*.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
     "bcrypt": "^5.1.1",
     "cors": "^2.8.5",
     "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
     "google-auth-library": "^9.6.3",
     "googleapis": "^126.0.0",
     "mercadopago": "^2.0.8",
@@ -18,7 +24,11 @@
     "resend": "^3.2.0",
     "stripe": "^14.21.0"
   },
+  "devDependencies": {
+    "dotenv": "^16.3.1"
+  },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
   }
 }
