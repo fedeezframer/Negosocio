@@ -1,5 +1,5 @@
 {
-  "name": "api-turnos-framer",
+  "name": "negosocio",
   "version": "1.0.0",
   "type": "module",
   "main": "api/server.js",
