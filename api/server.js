@@ -13,12 +13,12 @@ const app = express();
 const APPS_SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbzvcaYhHuyD-Xu63Aw9WpWrpcr5xmrgHW_IffXkmC90bs0pTzhWP1d8rWBaBuhG5Icx/exec";
 
-const BCRYPT_ROUNDS    = 10;
-const CACHE_DURATION   = 20000;   // ms
-const PLATAFORMA_FEE   = 0.025;   // 2.5% sobre precio total del servicio
-const API_URL          = "https://negosocio.onrender.com";
+const BCRYPT_ROUNDS  = 10;
+const CACHE_DURATION = 20000;  // ms
+const PLATAFORMA_FEE = 0.025;  // 2.5% sobre precio total del servicio
+const API_URL        = "https://negosocio.onrender.com";
 
-// ─── VALIDADORES ─────────────────────────────────────────────────────────[...]
+// ─── VALIDADORES ─────────────────────────────────────────────────────────────
 const getCleanSlug = (raw) => {
   if (!raw) return "";
   return raw.toLowerCase().trim()
@@ -28,25 +28,27 @@ const getCleanSlug = (raw) => {
 
 const validateEmail    = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const validatePassword = (p) => p && p.length >= 6;
-const validatePhone    = (p) => /^[0-9\-\s\+]{5,20}$/.test(p);
+// FIX: limpia espacios antes de validar (el InputData de Framer formatea con espacios)
+const validatePhone    = (p) => /^[0-9]{7,15}$/.test(p.toString().replace(/\s/g, ""));
+const cleanPhone       = (p) => p.toString().replace(/\s/g, "").trim();
 
 // ─── CACHÉ (keyed por slug) ───────────────────────────────────────────────────
 const globalCache = {};
 
-// ─── RATE LIMITING ────────────────────────────────────────────────────────[...]
+// ─── RATE LIMITING ────────────────────────────────────────────────────────────
 const limiterAuth    = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: "Demasiados intentos.", standardHeaders: true, legacyHeaders: false });
 const limiterBooking = rateLimit({ windowMs: 60 * 1000, max: 20, message: "Demasiadas reservas." });
 const limiterAPI     = rateLimit({ windowMs: 60 * 1000, max: 200 });
 
-// ─── CORS ───────────────────────────────────────────────────────────[...]
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization", "x-api-key"] }));
 app.use(express.json({ limit: "10mb" }));
 app.use(limiterAPI);
 
-// ─── SUPABASE ──────────────────────────────────────────────────────────[...]
+// ─── SUPABASE ─────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ─── MIDDLEWARE: BEARER TOKEN (por slug) ─────────────────────────────────────
+// ─── MIDDLEWARE: BEARER TOKEN ─────────────────────────────────────────────────
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers["authorization"];
@@ -82,13 +84,8 @@ const requireAdminKey = (req, res, next) => {
   next();
 };
 
-// ─── HELPERS DE COMISIÓN ─────────────────────────────────────────────────────
-/**
- * Calcula el service fee de la plataforma.
- * SIEMPRE sobre el precio total del servicio, no sobre la seña.
- * @param {number} precioTotalServicio - Precio completo del servicio
- * @returns {number} - Monto del fee redondeado a entero ARS
- */
+// ─── HELPER: COMISIÓN ────────────────────────────────────────────────────────
+// SIEMPRE sobre el precio total del servicio, nunca sobre la seña
 function calcularServiceFee(precioTotalServicio) {
   return Math.round(Number(precioTotalServicio) * PLATAFORMA_FEE);
 }
@@ -154,16 +151,57 @@ function agruparVentas(ventas, hoyISO) {
   };
 }
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // RUTAS BASE
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
-app.get("/", (req, res) => res.json({ status: "online", message: "NegoSocio API v4.0 — slug-based", timestamp: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "online", message: "NegoSocio API v4.1", timestamp: new Date().toISOString() }));
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
 
-// ════════════════════════════════════════════════════════════════[...]
+// ─── NUEVO: Endpoint público para BookingTrigger ──────────────────────────────
+// GET /negocio/:slug
+// Sin token. Devuelve solo lo necesario para decidir si cobrar o no.
+// No expone tokens ni datos sensibles, solo booleanos y config de precios.
+app.get("/negocio/:slug", async (req, res) => {
+  try {
+    const slug = getCleanSlug(req.params.slug);
+    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    const { data: user, error } = await supabase
+      .from("usuarios")
+      .select("slug, business_name, precio, monto_sena, duracion_turno, metodo_pago, mp_access_token, mobbex_api_key, horarios, excepciones, capacidad_por_turno")
+      .eq("slug", slug)
+      .single();
+
+    if (error || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+
+    res.json({
+      success: true,
+      negocio: {
+        slug:           user.slug,
+        business_name:  user.business_name,
+        precio:         user.precio,
+        monto_sena:     user.monto_sena || 0,
+        duracion_turno: user.duracion_turno,
+        metodo_pago:    user.metodo_pago || "none",
+        tiene_mp:       !!user.mp_access_token,
+        tiene_mobbex:   !!user.mobbex_api_key,
+        horarios:       user.horarios,
+        excepciones:    user.excepciones || [],
+        capacidad:      user.capacidad_por_turno || 1,
+        // Fee pre-calculado para mostrar en el front sin hacer math
+        service_fee:    calcularServiceFee(user.precio || 0),
+      },
+    });
+  } catch (e) {
+    console.error("Error en /negocio/:slug:", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ADMIN: CREAR CLIENTE
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /admin/crear-cliente
 // Headers: { "x-api-key": ADMIN_SECRET }
@@ -175,8 +213,7 @@ app.post("/admin/crear-cliente", requireAdminKey, async (req, res) => {
     if (!business_name || !slug || !email || !password) {
       return res.status(400).json({ success: false, error: "Faltan campos: business_name, slug, email, password." });
     }
-
-    if (!validateEmail(email))    return res.status(400).json({ success: false, error: "Email inválido." });
+    if (!validateEmail(email))       return res.status(400).json({ success: false, error: "Email inválido." });
     if (!validatePassword(password)) return res.status(400).json({ success: false, error: "Contraseña muy corta (mínimo 6 caracteres)." });
 
     const cleanSlug      = getCleanSlug(slug);
@@ -208,9 +245,9 @@ app.post("/admin/crear-cliente", requireAdminKey, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // AUTH
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /login — Body: { slug, password }
 app.post("/login", limiterAuth, async (req, res) => {
@@ -228,10 +265,12 @@ app.post("/login", limiterAuth, async (req, res) => {
     if (isHashed) {
       passwordOk = await bcrypt.compare(String(password), user.password);
     } else {
+      // Fallback para contraseñas viejas en texto plano — se migran al vuelo
       passwordOk = String(user.password) === String(password);
       if (passwordOk) {
         const newHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
         await supabase.from("usuarios").update({ password: newHash }).eq("slug", slug);
+        console.log(`🔐 Contraseña migrada a bcrypt: ${slug}`);
       }
     }
 
@@ -241,12 +280,12 @@ app.post("/login", limiterAuth, async (req, res) => {
     await supabase.from("usuarios").update({ access_token: newAccessToken }).eq("slug", slug);
 
     res.json({
-      success:      true,
-      slug:         user.slug,
-      access_token: newAccessToken,
+      success:       true,
+      slug:          user.slug,
+      access_token:  newAccessToken,
       business_name: user.business_name,
-      email:        user.email,
-      agenda_url:   `${API_URL}/agenda?u=${user.slug}`,
+      email:         user.email,
+      agenda_url:    `${API_URL}/agenda?u=${user.slug}`,
     });
   } catch (e) {
     console.error("Error en /login:", e.message);
@@ -265,7 +304,7 @@ app.get("/verify-session", async (req, res) => {
     const { data: user, error } = await supabase
       .from("usuarios").select("slug, access_token, business_name, email").eq("slug", slug).single();
 
-    if (error || !user)                          return res.json({ active: false, reason: "user_not_found" });
+    if (error || !user)                                    return res.json({ active: false, reason: "user_not_found" });
     if (!user.access_token || user.access_token !== token) return res.json({ active: false, reason: "invalid_token" });
 
     res.json({ active: true, slug: user.slug, business_name: user.business_name, email: user.email });
@@ -278,7 +317,7 @@ app.get("/verify-session", async (req, res) => {
 app.post("/api/request-password-reset", limiterAuth, async (req, res) => {
   try {
     const { email, newPassword } = req.body;
-    if (!email || !newPassword) return res.status(400).json({ success: false, error: "Faltan datos." });
+    if (!email || !newPassword)       return res.status(400).json({ success: false, error: "Faltan datos." });
     if (!validatePassword(newPassword)) return res.status(400).json({ success: false, error: "Mínimo 6 caracteres." });
 
     const { data: user } = await supabase.from("usuarios").select("slug").eq("email", email.trim().toLowerCase()).single();
@@ -318,9 +357,9 @@ app.post("/api/verify-and-reset-password", limiterAuth, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // PAGOS — Mercado Pago + Mobbex
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /api/create-preference
 // Body: { nombre, telefono, email, fecha, hora, slug, servicio_id? }
@@ -328,7 +367,7 @@ app.post("/api/verify-and-reset-password", limiterAuth, async (req, res) => {
 // LÓGICA DE COMISIÓN:
 //   precioTotalServicio = precio del servicio (siempre el 100%)
 //   serviceFee          = precioTotalServicio * 2.5%  ← va a nuestra cuenta
-//   montoSeña           = monto_sena del usuario (puede ser 33%, 50% o 100%)
+//   montoSeña           = monto_sena del usuario (33%, 50% o 100%)
 //   totalCobrado        = montoSeña + serviceFee
 //
 app.post("/api/create-preference", limiterBooking, async (req, res) => {
@@ -344,7 +383,7 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
     const { data: user, error: userError } = await supabase.from("usuarios").select("*").eq("slug", cleanSlug).single();
     if (userError || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
 
-    // ── Determinar servicio y precio base ──
+    // ── Servicio y precio base ──
     let precioTotalServicio = Number(user.precio || 0);
     let nombreServicio      = "Reserva";
     let servicioNombre      = null;
@@ -363,23 +402,20 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
     const debePagar = metodo === "sena" || metodo === "total";
     if (!debePagar || precioTotalServicio <= 0) return res.json({ isFree: true });
 
-    // Monto a cobrar al cliente por el servicio (seña o total)
     const montoServicio = metodo === "sena" && user.monto_sena
       ? Number(user.monto_sena)
       : precioTotalServicio;
 
-    // Service fee: SIEMPRE sobre el precio total, no sobre la seña
     const serviceFee   = calcularServiceFee(precioTotalServicio);
     const totalCobrado = montoServicio + serviceFee;
-
     const conceptoPago = metodo === "sena" ? "Seña" : "Total";
 
-    console.log(`💰 Comisión: servicio=$${precioTotalServicio} | seña=$${montoServicio} | fee=$${serviceFee} | total=$${totalCobrado}`);
+    console.log(`💰 ${cleanSlug}: servicio=$${precioTotalServicio} | seña=$${montoServicio} | fee=$${serviceFee} | total=$${totalCobrado}`);
 
     // Metadata compartida entre pasarelas
     const metaMeta = {
       nombre,
-      telefono,
+      telefono:        cleanPhone(telefono),
       email:           email || "",
       fecha,
       hora,
@@ -394,14 +430,9 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
     const successUrl = `https://negosocio.framer.website/success`;
     const cancelUrl  = `https://negosocio.framer.website/error`;
 
-    // ══════════════════════════════════════════════
-    // MOBBEX — prioridad (soporta split de pagos)
-    // ══════════════════════════════════════════════
+    // ── MOBBEX (prioridad — soporta split nativo) ──
     if (user.mobbex_api_key && user.mobbex_access_token) {
       try {
-        // Split: totalCobrado se divide entre el profesional y la plataforma
-        // El profesional recibe: montoServicio (ya descontado el costo de pasarela por Mobbex)
-        // La plataforma recibe: serviceFee
         const mobbexBody = {
           total:       totalCobrado,
           currency:    "ARS",
@@ -410,66 +441,33 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
           webhook:     `${API_URL}/webhook/mobbex`,
           return_url:  successUrl,
           items: [
-            {
-              image:       "",
-              description: `${nombreServicio} (${conceptoPago})`,
-              quantity:    1,
-              price:       montoServicio,
-            },
-            {
-              image:       "",
-              description: "Gasto de Gestión Online",
-              quantity:    1,
-              price:       serviceFee,
-            },
+            { image: "", description: `${nombreServicio} (${conceptoPago})`, quantity: 1, price: montoServicio },
+            { image: "", description: "Gasto de Gestión Online", quantity: 1, price: serviceFee },
           ],
-          // Split automático: la plataforma retiene el serviceFee
           split: [
-            {
-              tax_id: process.env.MOBBEX_PLATFORM_CUIT, // CUIT de la plataforma
-              total:  serviceFee,
-              fee:    0,
-            },
+            { tax_id: process.env.MOBBEX_PLATFORM_CUIT, total: serviceFee, fee: 0 },
           ],
           metadata: metaMeta,
-          options: {
-            button: false,
-            redirect: true,
-          },
+          options: { button: false, redirect: true },
         };
 
-        const mobbexRes = await fetch("https://api.mobbex.com/p/sessions", {
+        const mobbexRes  = await fetch("https://api.mobbex.com/p/sessions", {
           method: "POST",
-          headers: {
-            "Content-Type":    "application/json",
-            "x-api-key":       user.mobbex_api_key,
-            "x-access-token":  user.mobbex_access_token,
-          },
+          headers: { "Content-Type": "application/json", "x-api-key": user.mobbex_api_key, "x-access-token": user.mobbex_access_token },
           body: JSON.stringify(mobbexBody),
         });
-
         const mobbexData = await mobbexRes.json();
 
         if (mobbexData?.data?.url) {
-          return res.json({
-            payment_url:  mobbexData.data.url,
-            service_fee:  serviceFee,
-            total_cobrado: totalCobrado,
-            pasarela:     "mobbex",
-          });
+          return res.json({ payment_url: mobbexData.data.url, service_fee: serviceFee, total_cobrado: totalCobrado, pasarela: "mobbex" });
         }
-
-        console.warn("⚠️ Mobbex no devolvió URL, intentando con MP:", mobbexData);
+        console.warn("⚠️ Mobbex sin URL, fallback a MP:", mobbexData);
       } catch (e) {
-        console.error("Error con Mobbex, fallback a MP:", e.message);
+        console.error("Error Mobbex, fallback MP:", e.message);
       }
     }
 
-    // ══════════════════════════════════════════════
-    // MERCADO PAGO — fallback (sin split nativo)
-    // El service fee se cobra en un ítem separado
-    // visible para el cliente como "Gasto de Gestión"
-    // ══════════════════════════════════════════════
+    // ── MERCADO PAGO (fallback — fee como ítem separado) ──
     if (user.mp_access_token) {
       try {
         const client = new MercadoPagoConfig({ accessToken: user.mp_access_token });
@@ -478,18 +476,8 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
         const response = await pref.create({
           body: {
             items: [
-              {
-                title:      `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`,
-                unit_price: montoServicio,
-                quantity:   1,
-                currency_id: "ARS",
-              },
-              {
-                title:      "Gasto de Gestión Online",
-                unit_price: serviceFee,
-                quantity:   1,
-                currency_id: "ARS",
-              },
+              { title: `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`, unit_price: montoServicio, quantity: 1, currency_id: "ARS" },
+              { title: "Gasto de Gestión Online", unit_price: serviceFee, quantity: 1, currency_id: "ARS" },
             ],
             metadata: { ...metaMeta, tipo_pago: metodo },
             notification_url: `${API_URL}/webhook/mp`,
@@ -498,12 +486,7 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
           },
         });
 
-        return res.json({
-          payment_url:   response.init_point,
-          service_fee:   serviceFee,
-          total_cobrado: totalCobrado,
-          pasarela:      "mercadopago",
-        });
+        return res.json({ payment_url: response.init_point, service_fee: serviceFee, total_cobrado: totalCobrado, pasarela: "mercadopago" });
       } catch (e) {
         return res.status(500).json({ success: false, error: "Error con MercadoPago." });
       }
@@ -516,9 +499,9 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // OAUTH — Mercado Pago
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /oauth-callback?code=...&state=slug
 app.get("/oauth-callback", async (req, res) => {
@@ -552,11 +535,11 @@ app.get("/oauth-callback", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // WEBHOOKS
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// ── Helper compartido: guardar turno + venta en Supabase ──
+// Helper compartido: guarda turno + venta en Supabase y envía mail
 async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, hora, servicio_id, servicio_nombre, monto, moneda, service_fee, metodo_pago, payment_id, estado }) {
   let turnoId = null;
 
@@ -564,7 +547,7 @@ async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, ho
     const { data: turnoInsertado } = await supabase.from("turnos").insert([{
       slug,
       nombre:          nombre?.trim() || "Cliente",
-      telefono:        telefono?.toString().trim() || "N/A",
+      telefono:        cleanPhone(telefono?.toString() || "N/A"),
       email:           email?.trim() || null,
       fecha,
       hora,
@@ -577,7 +560,6 @@ async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, ho
 
     turnoId = turnoInsertado?.id || null;
 
-    // Notificación por email
     const { data: userNegocio } = await supabase.from("usuarios").select("email").eq("slug", slug).single();
     if (userNegocio?.email) {
       fetch(APPS_SCRIPT_URL, {
@@ -593,7 +575,6 @@ async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, ho
     }
   }
 
-  // Registrar venta (todos los estados, incluyendo pendiente/rechazado)
   await supabase.from("ventas").insert([{
     slug,
     turno_id:         turnoId,
@@ -606,14 +587,14 @@ async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, ho
     estado,
     nombre_cliente:   nombre?.trim() || "Cliente",
     email_cliente:    email?.trim() || null,
-    telefono_cliente: telefono?.toString().trim() || null,
+    telefono_cliente: cleanPhone(telefono?.toString() || ""),
     servicio_id:      servicio_id || null,
     servicio_nombre:  servicio_nombre || null,
     payment_id:       String(payment_id),
   }]);
 
   delete globalCache[slug];
-  console.log(`✅ Webhook procesado: ${slug} — ${estado} — $${monto} ARS | fee: $${service_fee}`);
+  console.log(`✅ Webhook OK: ${slug} — ${estado} — $${monto} ARS | fee: $${service_fee}`);
 }
 
 // POST /webhook/mp — Mercado Pago notifica pagos
@@ -624,7 +605,6 @@ app.post("/webhook/mp", async (req, res) => {
       const paymentId = query.id || body.data?.id;
       if (!paymentId) return res.sendStatus(200);
 
-      // Consultar con el token maestro de la plataforma
       const payRes  = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
         headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
       });
@@ -633,7 +613,6 @@ app.post("/webhook/mp", async (req, res) => {
       const slug = getCleanSlug(payData.metadata?.slug || "");
       if (!slug) return res.sendStatus(200);
 
-      // Re-consultar con el token del negocio para metadata completa
       const { data: userNegocio } = await supabase.from("usuarios").select("mp_access_token").eq("slug", slug).single();
       let meta = payData.metadata;
       if (userNegocio?.mp_access_token) {
@@ -647,20 +626,12 @@ app.post("/webhook/mp", async (req, res) => {
       const monto  = Number(payData.transaction_amount || 0);
 
       await procesarPagoConfirmado({
-        slug,
-        nombre:          meta.nombre,
-        telefono:        meta.telefono,
-        email:           meta.email,
-        fecha:           meta.fecha,
-        hora:            meta.hora,
-        servicio_id:     meta.servicio_id || null,
-        servicio_nombre: meta.servicio_nombre || null,
-        monto,
-        moneda:          payData.currency_id || "ARS",
-        service_fee:     Number(meta.service_fee || 0),
-        metodo_pago:     "mercadopago",
-        payment_id:      paymentId,
-        estado,
+        slug, nombre: meta.nombre, telefono: meta.telefono, email: meta.email,
+        fecha: meta.fecha, hora: meta.hora,
+        servicio_id: meta.servicio_id || null, servicio_nombre: meta.servicio_nombre || null,
+        monto, moneda: payData.currency_id || "ARS",
+        service_fee: Number(meta.service_fee || 0),
+        metodo_pago: "mercadopago", payment_id: paymentId, estado,
       });
     }
     res.sendStatus(200);
@@ -673,34 +644,23 @@ app.post("/webhook/mp", async (req, res) => {
 // POST /webhook/mobbex — Mobbex notifica pagos
 app.post("/webhook/mobbex", async (req, res) => {
   try {
-    const body = req.body;
-
-    // Mobbex envía status: 200 = aprobado, 400 = rechazado, 300-399 = pendiente
+    const body       = req.body;
     const statusCode = Number(body.status?.code || 0);
     const estado     = statusCode === 200 ? "aprobado" : statusCode >= 300 && statusCode < 400 ? "pendiente" : "rechazado";
-
-    const meta      = body.metadata || {};
-    const slug      = getCleanSlug(meta.slug || "");
-    const monto     = Number(body.total || 0);
-    const paymentId = body.id || body.payment?.id || "mobbex-" + Date.now();
+    const meta       = body.metadata || {};
+    const slug       = getCleanSlug(meta.slug || "");
+    const monto      = Number(body.total || 0);
+    const paymentId  = body.id || body.payment?.id || "mobbex-" + Date.now();
 
     if (!slug) return res.sendStatus(200);
 
     await procesarPagoConfirmado({
-      slug,
-      nombre:          meta.nombre,
-      telefono:        meta.telefono,
-      email:           meta.email,
-      fecha:           meta.fecha,
-      hora:            meta.hora,
-      servicio_id:     meta.servicio_id || null,
-      servicio_nombre: meta.servicio_nombre || null,
-      monto,
-      moneda:          "ARS",
-      service_fee:     Number(meta.service_fee || 0),
-      metodo_pago:     "mobbex",
-      payment_id:      paymentId,
-      estado,
+      slug, nombre: meta.nombre, telefono: meta.telefono, email: meta.email,
+      fecha: meta.fecha, hora: meta.hora,
+      servicio_id: meta.servicio_id || null, servicio_nombre: meta.servicio_nombre || null,
+      monto, moneda: "ARS",
+      service_fee: Number(meta.service_fee || 0),
+      metodo_pago: "mobbex", payment_id: paymentId, estado,
     });
 
     res.sendStatus(200);
@@ -710,16 +670,15 @@ app.post("/webhook/mobbex", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // TURNOS
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /get-occupied?slug=...&fecha=YYYY-MM-DD
 app.get("/get-occupied", async (req, res) => {
   try {
     const slug  = getCleanSlug(req.query.slug);
     const fecha = req.query.fecha;
-
     if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
 
     const query = supabase.from("turnos").select("hora").eq("slug", slug).neq("estado", "cancelado");
@@ -744,17 +703,23 @@ app.post("/create-booking", limiterBooking, async (req, res) => {
     if (!name || !phone || !fecha || !hora || !slug) {
       return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
     }
-    if (!validatePhone(phone.toString())) return res.status(400).json({ success: false, error: "Teléfono inválido." });
+
+    // FIX: limpiar espacios del teléfono antes de validar
+    const phoneClean = cleanPhone(phone.toString());
+    if (!validatePhone(phoneClean)) {
+      return res.status(400).json({ success: false, error: "Teléfono inválido. Usá solo números (7-15 dígitos)." });
+    }
 
     const cleanSlug = getCleanSlug(slug);
     const { data: user, error: userError } = await supabase.from("usuarios").select("*").eq("slug", cleanSlug).single();
     if (userError || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
 
-    // Si tiene pago configurado, no permitir reserva directa
-    const requierePago = user.mp_access_token && (user.metodo_pago === "sena" || user.metodo_pago === "total");
+    // Bloquear si el negocio requiere pago
+    const requierePago = (user.mp_access_token || user.mobbex_api_key) &&
+      (user.metodo_pago === "sena" || user.metodo_pago === "total");
     if (requierePago) return res.status(403).json({ success: false, error: "Este turno requiere pago previo." });
 
-    // Anti-duplicado
+    // Anti-duplicado: un turno activo por teléfono o email
     const hoy = new Date().toISOString().split("T")[0];
     const { data: turnosExistentes } = await supabase
       .from("turnos")
@@ -762,7 +727,7 @@ app.post("/create-booking", limiterBooking, async (req, res) => {
       .eq("slug", cleanSlug)
       .gte("fecha", hoy)
       .neq("estado", "cancelado")
-      .or(`telefono.eq.${phone.toString().trim()}${email ? `,email.eq.${email.trim().toLowerCase()}` : ""}`);
+      .or(`telefono.eq.${phoneClean}${email ? `,email.eq.${email.trim().toLowerCase()}` : ""}`);
 
     if (turnosExistentes && turnosExistentes.length > 0) {
       return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
@@ -778,7 +743,7 @@ app.post("/create-booking", limiterBooking, async (req, res) => {
       return res.status(400).json({ success: false, error: "Este turno ya está lleno." });
     }
 
-    // Obtener nombre del servicio
+    // Nombre del servicio si corresponde
     let servicioNombre = null;
     if (servicio_id) {
       const { data: srv } = await supabase.from("servicios").select("nombre").eq("id", servicio_id).single();
@@ -788,8 +753,8 @@ app.post("/create-booking", limiterBooking, async (req, res) => {
     const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
       slug:            cleanSlug,
       nombre:          name.trim(),
-      telefono:        phone.toString().trim(),
-      email:           email?.trim() || null,
+      telefono:        phoneClean,
+      email:           email?.trim().toLowerCase() || null,
       fecha,
       hora,
       servicio_id:     servicio_id || null,
@@ -800,7 +765,7 @@ app.post("/create-booking", limiterBooking, async (req, res) => {
 
     if (turnoError) throw turnoError;
 
-    // Notificación por email
+    // Notificación por email (no bloquea la respuesta)
     fetch(APPS_SCRIPT_URL, {
       method: "POST", headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({
@@ -825,7 +790,6 @@ app.post("/cancel-appointment", requireAuth, async (req, res) => {
   try {
     const { slug, turno_id } = req.body;
     const cleanSlug = getCleanSlug(slug);
-
     if (!turno_id) return res.status(400).json({ success: false, error: "Falta el turno_id." });
 
     const { error } = await supabase.from("turnos")
@@ -842,14 +806,14 @@ app.post("/cancel-appointment", requireAuth, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // SLOTS DISPONIBLES
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /slots-disponibles/:slug?fecha=YYYY-MM-DD&servicio_id=...
 app.get("/slots-disponibles/:slug", async (req, res) => {
   try {
-    const slug        = getCleanSlug(req.params.slug);
+    const slug              = getCleanSlug(req.params.slug);
     const { fecha, servicio_id } = req.query;
 
     if (!slug || !fecha) return res.status(400).json({ success: false, error: "Faltan slug o fecha." });
@@ -910,28 +874,13 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // SERVICIOS
-// ════════════════════════════════════════════════════════════════[...]
+// IMPORTANTE: /servicios/admin/:slug va ANTES de /servicios/:slug
+// para que Express no interprete "admin" como un slug.
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// GET /servicios/:slug — activos (web pública)
-app.get("/servicios/:slug", async (req, res) => {
-  try {
-    const slug = getCleanSlug(req.params.slug);
-    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
-
-    const { data, error } = await supabase
-      .from("servicios").select("id, nombre, descripcion, duracion, precio, capacidad")
-      .eq("slug", slug).eq("activo", true).order("created_at", { ascending: true });
-
-    if (error) throw error;
-    res.json({ success: true, servicios: data || [] });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// GET /servicios/admin/:slug — todos (panel, protegido)
+// GET /servicios/admin/:slug — todos los servicios (panel, protegido)
 app.get("/servicios/admin/:slug", async (req, res) => {
   try {
     const token = req.headers["authorization"]?.split(" ")[1];
@@ -949,7 +898,25 @@ app.get("/servicios/admin/:slug", async (req, res) => {
   }
 });
 
-// POST /servicios/crear (protegido) — Body: { slug, nombre, descripcion?, duracion, precio, capacidad? }
+// GET /servicios/:slug — servicios activos (web pública)
+app.get("/servicios/:slug", async (req, res) => {
+  try {
+    const slug = getCleanSlug(req.params.slug);
+    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    const { data, error } = await supabase
+      .from("servicios").select("id, nombre, descripcion, duracion, precio, capacidad")
+      .eq("slug", slug).eq("activo", true).order("created_at", { ascending: true });
+
+    if (error) throw error;
+    res.json({ success: true, servicios: data || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /servicios/crear (protegido)
+// Body: { slug, nombre, descripcion?, duracion, precio, capacidad? }
 app.post("/servicios/crear", requireAuth, async (req, res) => {
   try {
     const { slug, nombre, descripcion, duracion, precio, capacidad } = req.body;
@@ -974,7 +941,8 @@ app.post("/servicios/crear", requireAuth, async (req, res) => {
   }
 });
 
-// POST /servicios/editar (protegido) — Body: { slug, id, ...campos }
+// POST /servicios/editar (protegido)
+// Body: { slug, id, nombre?, descripcion?, duracion?, precio?, capacidad?, activo? }
 app.post("/servicios/editar", requireAuth, async (req, res) => {
   try {
     const { id, slug, nombre, descripcion, duracion, precio, capacidad, activo } = req.body;
@@ -1014,13 +982,12 @@ app.post("/servicios/eliminar", requireAuth, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// ADMIN STATS (panel del profesional) — CON SOPORTE MODO PÚBLICO
-// ═══════════════════════════════════════════════════════════════════
-
-// GET /admin-stats/:slug?public=true
-// Modo público: SIN necesidad de token para leer config básica
-// Modo privado: Requiere Bearer token para ver panel completo
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN STATS — Panel del profesional
+// GET /admin-stats/:slug
+// Modo público (?public=true): config mínima sin token — para BookingTrigger
+// Modo privado (Bearer token): panel completo con turnos y métricas de ventas
+// ═══════════════════════════════════════════════════════════════════════════════
 app.get("/admin-stats/:slug", async (req, res) => {
   try {
     const slug     = getCleanSlug(req.params.slug);
@@ -1029,8 +996,7 @@ app.get("/admin-stats/:slug", async (req, res) => {
 
     if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
 
-    // ── MODO PÚBLICO (Framer Component) ──
-    // Solo retorna config mínima sin necesidad de autenticación
+    // ── MODO PÚBLICO ──
     if (isPublic) {
       const { data: user, error } = await supabase
         .from("usuarios")
@@ -1038,9 +1004,7 @@ app.get("/admin-stats/:slug", async (req, res) => {
         .eq("slug", slug)
         .single();
 
-      if (error || !user) {
-        return res.status(404).json({ success: false, error: "Negocio no encontrado." });
-      }
+      if (error || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
 
       return res.json({
         stats: {
@@ -1049,17 +1013,14 @@ app.get("/admin-stats/:slug", async (req, res) => {
             monto_sena:    user.monto_sena || 0,
             metodo_pago:   user.metodo_pago || "none",
             mp_status:     user.mp_access_token ? "Conectado" : "Desconectado",
-            mobbex_status: user.mobbex_api_key ? "Conectado" : "Desconectado",
+            mobbex_status: user.mobbex_api_key  ? "Conectado" : "Desconectado",
           },
         },
       });
     }
 
-    // ── MODO PRIVADO (Panel Dashboard) ──
-    // Requiere Bearer token válido
-    if (!token) {
-      return res.status(401).json({ success: false, error: "No autorizado." });
-    }
+    // ── MODO PRIVADO ──
+    if (!token) return res.status(401).json({ success: false, error: "No autorizado." });
 
     const { data: authUser } = await supabase
       .from("usuarios").select("access_token").eq("slug", slug).single();
@@ -1081,8 +1042,8 @@ app.get("/admin-stats/:slug", async (req, res) => {
     const mesActual  = ahoraArg.getMonth() + 1;
     const diaHoyNum  = ahoraArg.getDate();
     const hoyISO     = `${anioActual}-${String(mesActual).padStart(2, "0")}-${String(diaHoyNum).padStart(2, "0")}`;
+    const inicioMes  = `${anioActual}-${String(mesActual).padStart(2, "0")}-01`;
 
-    const inicioMes = `${anioActual}-${String(mesActual).padStart(2, "0")}-01`;
     const { data: turnosMes } = await supabase
       .from("turnos").select("*")
       .eq("slug", slug)
@@ -1116,8 +1077,8 @@ app.get("/admin-stats/:slug", async (req, res) => {
       duracion: user.duracion_turno || 60,
     })).reverse();
 
-    const desde90 = new Date(ahoraArg); desde90.setDate(desde90.getDate() - 90);
-    const hasta7  = new Date(ahoraArg); hasta7.setDate(hasta7.getDate() + 7);
+    const desde90    = new Date(ahoraArg); desde90.setDate(desde90.getDate() - 90);
+    const hasta7     = new Date(ahoraArg); hasta7.setDate(hasta7.getDate() + 7);
     const desde90ISO = desde90.toISOString().split("T")[0];
     const hasta7ISO  = hasta7.toISOString().split("T")[0];
 
@@ -1137,7 +1098,6 @@ app.get("/admin-stats/:slug", async (req, res) => {
       ...(metricas.porDia[fecha] || { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 }),
     }));
 
-    // Fee total generado por la plataforma en el período
     const feeTotal = (ventas || [])
       .filter((v) => v.estado === "aprobado")
       .reduce((acc, v) => acc + Number(v.service_fee || 0), 0);
@@ -1150,8 +1110,8 @@ app.get("/admin-stats/:slug", async (req, res) => {
         agenda_url:     `${API_URL}/agenda?u=${user.slug}`,
 
         turnosHoy,
-        turnosMes:      turnosMesTotal,
-        chartData:      Object.keys(semanas).map((k) => ({ label: k, turnos: semanas[k] })),
+        turnosMes:   turnosMesTotal,
+        chartData:   Object.keys(semanas).map((k) => ({ label: k, turnos: semanas[k] })),
         turnosLista,
 
         ventas: {
@@ -1171,9 +1131,9 @@ app.get("/admin-stats/:slug", async (req, res) => {
           },
         },
 
-        ventasPorDia:  metricas.porDia,
-        ventasPorSem:  metricas.porSemana,
-        ventasPorMes:  metricas.porMes,
+        ventasPorDia: metricas.porDia,
+        ventasPorSem: metricas.porSemana,
+        ventasPorMes: metricas.porMes,
         proximosDias,
 
         horarios: user.horarios,
@@ -1182,8 +1142,8 @@ app.get("/admin-stats/:slug", async (req, res) => {
           precio:        user.precio,
           monto_sena:    user.monto_sena  || 0,
           metodo_pago:   user.metodo_pago || "none",
-          mp_status:     user.mp_access_token   ? "Conectado" : "Desconectado",
-          mobbex_status: user.mobbex_api_key    ? "Conectado" : "Desconectado",
+          mp_status:     user.mp_access_token ? "Conectado" : "Desconectado",
+          mobbex_status: user.mobbex_api_key  ? "Conectado" : "Desconectado",
           excepciones:   user.excepciones || [],
         },
       },
@@ -1197,9 +1157,9 @@ app.get("/admin-stats/:slug", async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // SETTINGS
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /update-settings (protegido)
 // Body: { slug, precio?, horarios?, duracion_turno?, ocupados?, monto_sena?, metodo_pago? }
@@ -1231,9 +1191,9 @@ app.post("/update-settings", requireAuth, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // 404 Y ERROR HANDLER
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 app.use("*", (req, res) => {
   res.status(404).json({ success: false, error: "Ruta no encontrada.", path: req.originalUrl });
@@ -1244,18 +1204,19 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, error: "Error interno del servidor." });
 });
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // ARRANQUE
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`
   ╔════════════════════════════════════════════╗
-  ║   NegoSocio API v4.0 — Online             ║
+  ║   NegoSocio API v4.1 — Online             ║
   ║   Identificador: SLUG                     ║
   ║   Comisión plataforma: 2.5%               ║
   ║   Pasarelas: Mobbex + Mercado Pago        ║
+  ║   Nuevo endpoint: GET /negocio/:slug      ║
   ║   Puerto: ${PORT}                           ║
   ╚════════════════════════════════════════════╝
   `);
