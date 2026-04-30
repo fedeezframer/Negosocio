@@ -980,6 +980,137 @@ app.post("/servicios/eliminar", requireAuth, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRO PÚBLICO
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.post("/register", async (req, res) => {
+    try {
+        const {
+            nombre_persona,
+            business_name,
+            email,
+            password,
+            telefono,
+            precio,
+            duracion_turno,
+            horarios,
+        } = req.body
+
+        if (!nombre_persona || !business_name || !email || !password) {
+            return res.status(400).json({
+                error: "Faltan campos obligatorios: nombre_persona, business_name, email, password.",
+            })
+        }
+
+        // Generar slug desde business_name
+        const slug = business_name
+            .toUpperCase()
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[^A-Z0-9]/g, "")
+            .slice(0, 30)
+
+        if (!slug || slug.length < 2) {
+            return res.status(400).json({
+                error: "El nombre del negocio no es válido para generar un identificador.",
+            })
+        }
+
+        // Verificar si el slug ya existe
+        const { data: slugExistente } = await supabase
+            .from("usuarios")
+            .select("slug")
+            .eq("slug", slug)
+            .single()
+
+        if (slugExistente) {
+            return res.status(409).json({
+                error: `El nombre de negocio "${business_name}" ya está registrado. Elegí otro nombre.`,
+            })
+        }
+
+        // Verificar si el email ya existe
+        const { data: emailExistente } = await supabase
+            .from("usuarios")
+            .select("email")
+            .eq("email", email.toLowerCase().trim())
+            .single()
+
+        if (emailExistente) {
+            return res.status(409).json({
+                error: "Este email ya está registrado.",
+            })
+        }
+
+        // Hashear password
+        const hashedPassword = await bcrypt.hash(password, 10)
+
+        // Horarios por defecto si no vienen
+        const horariosDefault = {
+            lunes:     { activo: true,  jornada: ["09:00", "20:00"], descanso: ["13:00", "15:00"] },
+            martes:    { activo: true,  jornada: ["09:00", "20:00"], descanso: ["13:00", "15:00"] },
+            miercoles: { activo: true,  jornada: ["09:00", "20:00"], descanso: ["13:00", "15:00"] },
+            jueves:    { activo: true,  jornada: ["09:00", "20:00"], descanso: ["13:00", "15:00"] },
+            viernes:   { activo: true,  jornada: ["09:00", "20:00"], descanso: ["13:00", "15:00"] },
+            sabado:    { activo: false, jornada: [null, null],       descanso: [null, null] },
+            domingo:   { activo: false, jornada: [null, null],       descanso: [null, null] },
+        }
+
+        // Insertar usuario en Supabase
+        const { data: nuevoUsuario, error: insertError } = await supabase
+            .from("usuarios")
+            .insert([{
+                email: email.toLowerCase().trim(),
+                password: hashedPassword,
+                slug,
+                nombre_persona: nombre_persona.trim(),
+                business_name: business_name.trim(),
+                telefono: telefono?.trim() || "",
+                precio: Number(precio) || 0,
+                duracion_turno: Number(duracion_turno) || 30,
+                metodo_pago: "none",
+                horarios: horarios || horariosDefault,
+                excepciones: [],
+            }])
+            .select()
+            .single()
+
+        if (insertError) {
+            console.error("❌ Error al insertar usuario:", insertError.message)
+            return res.status(500).json({ error: "Error al crear el usuario." })
+        }
+
+        // Mandar mail de bienvenida via Apps Script
+        try {
+            await fetch(process.env.APPS_SCRIPT_URL, {
+                method: "POST",
+                headers: { "Content-Type": "text/plain" },
+                body: JSON.stringify({
+                    action: "welcomeEmail",
+                    email: email.toLowerCase().trim(),
+                    usuario: slug,
+                    business_name: business_name.trim(),
+                }),
+            })
+        } catch (mailErr) {
+            console.error("⚠️ Error al mandar mail de bienvenida:", mailErr.message)
+        }
+
+        console.log(`✅ Nuevo negocio registrado: ${slug} (${email})`)
+
+        res.json({
+            success: true,
+            slug,
+            message: "Registro exitoso.",
+        })
+
+    } catch (e) {
+        console.error("❌ Error en /register:", e.message)
+        res.status(500).json({ error: "Error interno al registrar." })
+    }
+})
+
 // ════════════════════════════════════════════════════════════════[...]
 // ADMIN STATS — Panel del profesional
 // ════════════════════════════════════════════════════════════════[...]
