@@ -759,7 +759,7 @@ app.post("/create-booking", limiterBooking, async (req, res) => {
       hora,
       servicio_id:     servicio_id || null,
       servicio_nombre: servicioNombre,
-      estado:          "pendiente",
+      estado:          "confirmado",
       metodo_pago:     "none",
     }]).select().single();
 
