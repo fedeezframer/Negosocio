@@ -18,7 +18,7 @@ const CACHE_DURATION = 20000;  // ms
 const PLATAFORMA_FEE = 0.025;  // 2.5% sobre precio total del servicio
 const API_URL        = "https://negosocio.onrender.com";
 
-// ─── VALIDADORES ─────────────────────────────────────────────────────────[...]
+// ─── VALIDADORES ─────────────────────────────────────────────────────────────
 const getCleanSlug = (raw) => {
   if (!raw) return "";
   return raw.toLowerCase().trim()
@@ -35,17 +35,17 @@ const cleanPhone       = (p) => p.toString().replace(/\s/g, "").trim();
 // ─── CACHÉ (keyed por slug) ───────────────────────────────────────────────────
 const globalCache = {};
 
-// ─── RATE LIMITING ────────────────────────────────────────────────────────[...]
+// ─── RATE LIMITING ────────────────────────────────────────────────────────────
 const limiterAuth    = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: "Demasiados intentos.", standardHeaders: true, legacyHeaders: false });
 const limiterBooking = rateLimit({ windowMs: 60 * 1000, max: 20, message: "Demasiadas reservas." });
 const limiterAPI     = rateLimit({ windowMs: 60 * 1000, max: 200 });
 
-// ─── CORS ───────────────────────────────────────────────────────────[...]
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization", "x-api-key"] }));
 app.use(express.json({ limit: "10mb" }));
 app.use(limiterAPI);
 
-// ─── SUPABASE ──────────────────────────────────────────────────────────[...]
+// ─── SUPABASE ─────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // ─── MIDDLEWARE: BEARER TOKEN ─────────────────────────────────────────────────
@@ -84,7 +84,7 @@ const requireAdminKey = (req, res, next) => {
   next();
 };
 
-// ─── HELPER: COMISIÓN ────────────────────────────────────────────────────────[...]
+// ─── HELPER: COMISIÓN ────────────────────────────────────────────────────────
 // SIEMPRE sobre el precio total del servicio, nunca sobre la seña
 function calcularServiceFee(precioTotalServicio) {
   return Math.round(Number(precioTotalServicio) * PLATAFORMA_FEE);
@@ -151,16 +151,57 @@ function agruparVentas(ventas, hoyISO) {
   };
 }
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // RUTAS BASE
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
-app.get("/", (req, res) => res.json({ status: "online", message: "NegoSocio API v4.2", timestamp: new Date().toISOString() }));
+app.get("/", (req, res) => res.json({ status: "online", message: "NegoSocio API v4.1", timestamp: new Date().toISOString() }));
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
 
-// ════════════════════════════════════════════════════════════════[...]
+// ─── NUEVO: Endpoint público para BookingTrigger ──────────────────────────────
+// GET /negocio/:slug
+// Sin token. Devuelve solo lo necesario para decidir si cobrar o no.
+// No expone tokens ni datos sensibles, solo booleanos y config de precios.
+app.get("/negocio/:slug", async (req, res) => {
+  try {
+    const slug = getCleanSlug(req.params.slug);
+    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    const { data: user, error } = await supabase
+      .from("usuarios")
+      .select("slug, business_name, precio, monto_sena, duracion_turno, metodo_pago, mp_access_token, mobbex_api_key, horarios, excepciones, capacidad_por_turno")
+      .eq("slug", slug)
+      .single();
+
+    if (error || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+
+    res.json({
+      success: true,
+      negocio: {
+        slug:           user.slug,
+        business_name:  user.business_name,
+        precio:         user.precio,
+        monto_sena:     user.monto_sena || 0,
+        duracion_turno: user.duracion_turno,
+        metodo_pago:    user.metodo_pago || "none",
+        tiene_mp:       !!user.mp_access_token,
+        tiene_mobbex:   !!user.mobbex_api_key,
+        horarios:       user.horarios,
+        excepciones:    user.excepciones || [],
+        capacidad:      user.capacidad_por_turno || 1,
+        // Fee pre-calculado para mostrar en el front sin hacer math
+        service_fee:    calcularServiceFee(user.precio || 0),
+      },
+    });
+  } catch (e) {
+    console.error("Error en /negocio/:slug:", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ADMIN: CREAR CLIENTE
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /admin/crear-cliente
 // Headers: { "x-api-key": ADMIN_SECRET }
@@ -204,9 +245,101 @@ app.post("/admin/crear-cliente", requireAdminKey, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
+// REGISTRO PÚBLICO — Onboarding desde Framer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// POST /register — sin API key, para el onboarding público
+// Body: { business_name, email, password, nombre_persona?, telefono?,
+//         precio?, duracion_turno?, horarios? }
+// horarios debe venir en formato JSONB:
+//   { lunes: { activo: true, jornada: ["09:00","18:00"], descanso: [null,null] } }
+app.post("/register", limiterAuth, async (req, res) => {
+  try {
+    const {
+      business_name,
+      email,
+      password,
+      nombre_persona,
+      telefono,
+      precio,
+      duracion_turno,
+      horarios,
+    } = req.body;
+
+    // Validaciones básicas
+    if (!business_name || !email || !password) {
+      return res.status(400).json({ success: false, error: "Faltan campos obligatorios: business_name, email, password." });
+    }
+    if (!validateEmail(email)) {
+      return res.status(400).json({ success: false, error: "Email inválido." });
+    }
+    if (!validatePassword(password)) {
+      return res.status(400).json({ success: false, error: "La contraseña debe tener al menos 6 caracteres." });
+    }
+
+    // Verificar que el email no esté registrado ya
+    const { data: existing } = await supabase
+      .from("usuarios")
+      .select("id")
+      .eq("email", email.trim().toLowerCase())
+      .single();
+
+    if (existing) {
+      return res.status(409).json({ success: false, error: "Ya existe una cuenta con ese email." });
+    }
+
+    const cleanSlug      = getCleanSlug(business_name);
+    const hashedPassword = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
+
+    // Horarios por defecto si no vienen en el body
+    const horariosDefault = {
+      lunes:     { activo: true,  jornada: ["09:00","20:00"], descanso: ["13:00","15:00"] },
+      martes:    { activo: true,  jornada: ["09:00","20:00"], descanso: ["13:00","15:00"] },
+      miercoles: { activo: true,  jornada: ["09:00","20:00"], descanso: ["13:00","15:00"] },
+      jueves:    { activo: true,  jornada: ["09:00","20:00"], descanso: ["13:00","15:00"] },
+      viernes:   { activo: true,  jornada: ["09:00","20:00"], descanso: ["13:00","15:00"] },
+      sabado:    { activo: false, jornada: [null, null],      descanso: [null, null] },
+      domingo:   { activo: false, jornada: [null, null],      descanso: [null, null] },
+    };
+
+    const { data, error } = await supabase.from("usuarios").insert([{
+      business_name:  business_name.trim(),
+      slug:           cleanSlug,
+      email:          email.trim().toLowerCase(),
+      password:       hashedPassword,
+      nombre_persona: nombre_persona?.trim() || "Dueño",
+      telefono:       telefono ? cleanPhone(telefono) : null,
+      precio:         parseInt(precio)         || 0,
+      duracion_turno: parseInt(duracion_turno) || 30,
+      metodo_pago:    "none",
+      excepciones:    [],
+      horarios:       horarios || horariosDefault,
+    }]).select("slug, business_name, email").single();
+
+    if (error) {
+      if (error.code === "23505") {
+        return res.status(409).json({ success: false, error: "Ese nombre de negocio ya está en uso. Probá con otro." });
+      }
+      throw error;
+    }
+
+    console.log(`✅ Registro público: ${cleanSlug}`);
+    res.status(201).json({
+      success:    true,
+      slug:       cleanSlug,
+      agenda_url: `https://negosocio.framer.website/agenda?u=${cleanSlug}`,
+      message:    "Cuenta creada con éxito.",
+    });
+  } catch (e) {
+    console.error("Error en /register:", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // AUTH
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /login — Body: { slug, password }
 app.post("/login", limiterAuth, async (req, res) => {
@@ -316,9 +449,9 @@ app.post("/api/verify-and-reset-password", limiterAuth, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // PAGOS — Mercado Pago + Mobbex
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /api/create-preference
 // Body: { nombre, telefono, email, fecha, hora, slug, servicio_id? }
@@ -458,9 +591,9 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // OAUTH — Mercado Pago
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /oauth-callback?code=...&state=slug
 app.get("/oauth-callback", async (req, res) => {
@@ -494,9 +627,9 @@ app.get("/oauth-callback", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // WEBHOOKS
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // Helper compartido: guarda turno + venta en Supabase y envía mail
 async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, hora, servicio_id, servicio_nombre, monto, moneda, service_fee, metodo_pago, payment_id, estado }) {
@@ -629,9 +762,9 @@ app.post("/webhook/mobbex", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // TURNOS
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /get-occupied?slug=...&fecha=YYYY-MM-DD
 app.get("/get-occupied", async (req, res) => {
@@ -718,7 +851,7 @@ app.post("/create-booking", limiterBooking, async (req, res) => {
       hora,
       servicio_id:     servicio_id || null,
       servicio_nombre: servicioNombre,
-      estado:          "confirmado",
+      estado:          "pendiente",
       metodo_pago:     "none",
     }]).select().single();
 
@@ -765,51 +898,9 @@ app.post("/cancel-appointment", requireAuth, async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
-// NEGOCIO PÚBLICO — config sin token, para componentes de Framer
-// ════════════════════════════════════════════════════════════════[...]
-
-// GET /negocio/:slug
-// Devuelve config pública del negocio: horarios, excepciones, metodo_pago, etc.
-// NO requiere token — lo usan CalendarGrid, TimeSlots y BookingTrigger
-app.get("/negocio/:slug", async (req, res) => {
-  try {
-    const slug = getCleanSlug(req.params.slug);
-    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
-
-    const { data: user, error } = await supabase
-      .from("usuarios")
-      .select("slug, business_name, horarios, excepciones, duracion_turno, capacidad_por_turno, metodo_pago, monto_sena, precio, mp_access_token, mobbex_api_key")
-      .eq("slug", slug)
-      .single();
-
-    if (error || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
-
-    res.json({
-      success: true,
-      negocio: {
-        slug:               user.slug,
-        business_name:      user.business_name,
-        horarios:           user.horarios || {},
-        excepciones:        user.excepciones || [],
-        duracion_turno:     user.duracion_turno || 30,
-        capacidad_por_turno:user.capacidad_por_turno || 1,
-        metodo_pago:        user.metodo_pago || "none",
-        monto_sena:         user.monto_sena || 0,
-        precio:             user.precio || 0,
-        tiene_mp:           !!user.mp_access_token,
-        tiene_mobbex:       !!user.mobbex_api_key,
-      },
-    });
-  } catch (e) {
-    console.error("Error en /negocio/:slug:", e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ════════════════════════════════════════════════════════════════[...]
-// SLOTS DISPONIBLES — ✅ FIXED: Lee turnos activos de la BD
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
+// SLOTS DISPONIBLES
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /slots-disponibles/:slug?fecha=YYYY-MM-DD&servicio_id=...
 app.get("/slots-disponibles/:slug", async (req, res) => {
@@ -852,13 +943,9 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
       cursor += duracion;
     }
 
-    // ✅ FIXED: Consulta correcta a la BD
     const { data: turnosDia } = await supabase
-      .from("turnos")
-      .select("hora, estado")
-      .eq("slug", slug)
-      .eq("fecha", fecha)
-      .in("estado", ["confirmado", "pendiente"]); // Solo turnos activos
+      .from("turnos").select("hora")
+      .eq("slug", slug).eq("fecha", fecha).neq("estado", "cancelado");
 
     const reservasPorSlot = {};
     (turnosDia || []).forEach((t) => {
@@ -872,7 +959,6 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
       return { hora: slot, disponibles: Math.max(0, disponibles), lleno: disponibles <= 0 };
     });
 
-    console.log(`📅 ${slug} ${fecha}: ${slotsGenerados.length} slots teóricos, ${turnosDia?.length || 0} turnos activos, ${slots.filter(s => !s.lleno).length} disponibles`);
     res.json({ success: true, slots });
   } catch (e) {
     console.error("Error en /slots-disponibles:", e.message);
@@ -880,12 +966,13 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
   }
 });
 
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // SERVICIOS
 // IMPORTANTE: /servicios/admin/:slug va ANTES de /servicios/:slug
-// ════════════════════════════════════════════════════════════════[...]
+// para que Express no interprete "admin" como un slug.
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// GET /servicios/admin/:slug — todos (panel, protegido)
+// GET /servicios/admin/:slug — todos los servicios (panel, protegido)
 app.get("/servicios/admin/:slug", async (req, res) => {
   try {
     const token = req.headers["authorization"]?.split(" ")[1];
@@ -903,7 +990,7 @@ app.get("/servicios/admin/:slug", async (req, res) => {
   }
 });
 
-// GET /servicios/:slug — activos (público)
+// GET /servicios/:slug — servicios activos (web pública)
 app.get("/servicios/:slug", async (req, res) => {
   try {
     const slug = getCleanSlug(req.params.slug);
@@ -921,6 +1008,7 @@ app.get("/servicios/:slug", async (req, res) => {
 });
 
 // POST /servicios/crear (protegido)
+// Body: { slug, nombre, descripcion?, duracion, precio, capacidad? }
 app.post("/servicios/crear", requireAuth, async (req, res) => {
   try {
     const { slug, nombre, descripcion, duracion, precio, capacidad } = req.body;
@@ -929,8 +1017,13 @@ app.post("/servicios/crear", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "Faltan campos." });
     }
     const { data, error } = await supabase.from("servicios").insert([{
-      slug: cleanSlug, nombre: nombre.trim(), descripcion: descripcion?.trim() || "",
-      duracion: parseInt(duracion), precio: Number(precio), capacidad: parseInt(capacidad) || 1, activo: true,
+      slug:        cleanSlug,
+      nombre:      nombre.trim(),
+      descripcion: descripcion?.trim() || "",
+      duracion:    parseInt(duracion),
+      precio:      Number(precio),
+      capacidad:   parseInt(capacidad) || 1,
+      activo:      true,
     }]).select().single();
     if (error) throw error;
     delete globalCache[cleanSlug];
@@ -941,6 +1034,7 @@ app.post("/servicios/crear", requireAuth, async (req, res) => {
 });
 
 // POST /servicios/editar (protegido)
+// Body: { slug, id, nombre?, descripcion?, duracion?, precio?, capacidad?, activo? }
 app.post("/servicios/editar", requireAuth, async (req, res) => {
   try {
     const { id, slug, nombre, descripcion, duracion, precio, capacidad, activo } = req.body;
@@ -964,11 +1058,11 @@ app.post("/servicios/editar", requireAuth, async (req, res) => {
   }
 });
 
-// POST /servicios/eliminar (protegido)
+// POST /servicios/eliminar (protegido) — Body: { slug, id }
 app.post("/servicios/eliminar", requireAuth, async (req, res) => {
   try {
     const { id, slug } = req.body;
-    const cleanSlug = getCleanSlug(slug);
+    const cleanSlug    = getCleanSlug(slug);
     if (!id) return res.status(400).json({ success: false, error: "Falta el id." });
 
     const { error } = await supabase.from("servicios").delete().eq("id", id).eq("slug", cleanSlug);
@@ -980,161 +1074,52 @@ app.post("/servicios/eliminar", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/register", async (req, res) => {
-  try {
-    const {
-      nombre,
-      apellido,
-      email,
-      telefono,
-      nombre_negocio,
-      password,
-      precio,
-      duracion_turno,
-      ...rest
-    } = req.body
-
-    // ── Validaciones básicas ──────────────────────────────────────────────────
-    if (!nombre || !email || !password || !nombre_negocio) {
-      return res.status(400).json({
-        error: "Faltan campos obligatorios: nombre, email, password, nombre_negocio.",
-      })
-    }
-
-    if (!validateEmail(email)) {
-      return res.status(400).json({ error: "Email inválido." })
-    }
-
-    if (!validatePassword(password)) {
-      return res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres." })
-    }
-
-    // ── Generar slug en minúsculas con guiones (igual que getCleanSlug) ───────
-    const slug = nombre_negocio
-      .toLowerCase()
-      .trim()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/[^a-z0-9-]/g, "")
-      .slice(0, 30)
-
-    if (!slug || slug.length < 2) {
-      return res.status(400).json({
-        error: "El nombre del negocio no es válido. Usá letras y números.",
-      })
-    }
-
-    // ── Verificar duplicados ──────────────────────────────────────────────────
-    const { data: slugExistente } = await supabase
-      .from("usuarios")
-      .select("slug")
-      .eq("slug", slug)
-      .maybeSingle()
-
-    if (slugExistente) {
-      return res.status(409).json({
-        error: `El nombre "${nombre_negocio}" ya está en uso. Elegí otro nombre para tu negocio.`,
-      })
-    }
-
-    const { data: emailExistente } = await supabase
-      .from("usuarios")
-      .select("email")
-      .eq("email", email.toLowerCase().trim())
-      .maybeSingle()
-
-    if (emailExistente) {
-      return res.status(409).json({ error: "Este email ya está registrado." })
-    }
-
-    // ── Estructurar horarios desde los campos del form ────────────────────────
-    const dias = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
-    const horariosDB = {}
-
-    dias.forEach((dia) => {
-      const inicio = rest[`${dia}_inicio`] || ""
-      const fin    = rest[`${dia}_fin`]    || ""
-      const activo = inicio.length >= 5 && fin.length >= 5
-
-      horariosDB[dia] = {
-        activo,
-        jornada:  activo ? [inicio, fin] : [null, null],
-        descanso: [null, null],
-      }
-    })
-
-    // ── Hashear password con bcrypt (igual que el login) ─────────────────────
-    const hashedPassword = await bcrypt.hash(String(password), BCRYPT_ROUNDS)
-
-    // ── Insertar en public.usuarios ───────────────────────────────────────────
-    const { error: insertError } = await supabase
-      .from("usuarios")
-      .insert([{
-        email:          email.toLowerCase().trim(),
-        password:       hashedPassword,
-        slug,
-        nombre_persona: nombre.trim(),
-        business_name:  nombre_negocio.trim(),
-        telefono:       telefono?.trim() || "",
-        precio:         Number(precio) || 0,
-        duracion_turno: Number(duracion_turno) || 30,
-        metodo_pago:    "none",
-        horarios:       horariosDB,
-        excepciones:    [],
-      }])
-
-    if (insertError) {
-      console.error("Error al insertar usuario:", insertError.message)
-      if (insertError.code === "23505") {
-        return res.status(409).json({ error: "El slug o email ya existe." })
-      }
-      return res.status(500).json({ error: "Error al guardar los datos del negocio." })
-    }
-
-    // ── Mail de bienvenida ────────────────────────────────────────────────────
-    fetch(APPS_SCRIPT_URL, {
-      method:  "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({
-        action:        "welcomeEmail",
-        email:         email.toLowerCase().trim(),
-        usuario:       slug,
-        business_name: nombre_negocio.trim(),
-      }),
-    }).catch((e) => console.error("Error mail bienvenida:", e.message))
-
-    console.log(`Nuevo negocio registrado: ${slug} (${email})`)
-
-    res.json({
-      success: true,
-      slug,
-      message: "Registro exitoso.",
-    })
-
-  } catch (e) {
-    console.error("Error en /register:", e.message)
-    res.status(500).json({ error: "Error interno al registrar." })
-  }
-})
-
-// ════════════════════════════════════════════════════════════════[...]
+// ═══════════════════════════════════════════════════════════════════════════════
 // ADMIN STATS — Panel del profesional
-// ════════════════════════════════════════════════════════════════[...]
+// GET /admin-stats/:slug
+// Modo público (?public=true): config mínima sin token — para BookingTrigger
+// Modo privado (Bearer token): panel completo con turnos y métricas de ventas
+// ═══════════════════════════════════════════════════════════════════════════════
 app.get("/admin-stats/:slug", async (req, res) => {
   try {
-    const slug  = getCleanSlug(req.params.slug);
-    const token = req.headers["authorization"]?.split(" ")[1];
+    const slug     = getCleanSlug(req.params.slug);
+    const isPublic = req.query.public === "true";
+    const token    = req.headers["authorization"]?.split(" ")[1];
 
     if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    // ── MODO PÚBLICO ──
+    if (isPublic) {
+      const { data: user, error } = await supabase
+        .from("usuarios")
+        .select("slug, precio, monto_sena, metodo_pago, mp_access_token, mobbex_api_key")
+        .eq("slug", slug)
+        .single();
+
+      if (error || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+
+      return res.json({
+        stats: {
+          config: {
+            precio:        user.precio || 0,
+            monto_sena:    user.monto_sena || 0,
+            metodo_pago:   user.metodo_pago || "none",
+            mp_status:     user.mp_access_token ? "Conectado" : "Desconectado",
+            mobbex_status: user.mobbex_api_key  ? "Conectado" : "Desconectado",
+          },
+        },
+      });
+    }
+
+    // ── MODO PRIVADO ──
     if (!token) return res.status(401).json({ success: false, error: "No autorizado." });
 
     const { data: authUser } = await supabase
-      .from("usuarios").select("access_token, read_token").eq("slug", slug).single();
+      .from("usuarios").select("access_token").eq("slug", slug).single();
 
-    // Acepta access_token (sesión) o read_token (solo lectura)
-    const tokenValido = authUser && (authUser.access_token === token || authUser.read_token === token);
-    if (!tokenValido) return res.status(401).json({ success: false, error: "No autorizado." });
+    if (!authUser || authUser.access_token !== token) {
+      return res.status(401).json({ success: false, error: "No autorizado." });
+    }
 
     const now = Date.now();
     if (globalCache[slug] && now - globalCache[slug].timestamp < CACHE_DURATION) {
@@ -1173,12 +1158,19 @@ app.get("/admin-stats/:slug", async (req, res) => {
     });
 
     const turnosLista = turnosData.map((t) => ({
-      id: t.id, nombre: t.nombre, telefono: t.telefono, email: t.email,
-      fecha: t.fecha, hora: t.hora.slice(0, 5), servicio: t.servicio_nombre, estado: t.estado, duracion: user.duracion_turno || 60,
+      id:       t.id,
+      nombre:   t.nombre,
+      telefono: t.telefono,
+      email:    t.email,
+      fecha:    t.fecha,
+      hora:     t.hora.slice(0, 5),
+      servicio: t.servicio_nombre,
+      estado:   t.estado,
+      duracion: user.duracion_turno || 60,
     })).reverse();
 
-    const desde90 = new Date(ahoraArg); desde90.setDate(desde90.getDate() - 90);
-    const hasta7  = new Date(ahoraArg); hasta7.setDate(hasta7.getDate() + 7);
+    const desde90    = new Date(ahoraArg); desde90.setDate(desde90.getDate() - 90);
+    const hasta7     = new Date(ahoraArg); hasta7.setDate(hasta7.getDate() + 7);
     const desde90ISO = desde90.toISOString().split("T")[0];
     const hasta7ISO  = hasta7.toISOString().split("T")[0];
 
@@ -1189,10 +1181,10 @@ app.get("/admin-stats/:slug", async (req, res) => {
       .lte("fecha_turno", hasta7ISO)
       .order("fecha_pago", { ascending: true });
 
-    const metricas = agruparVentas(ventas || [], hoyISO);
-    const mesKey = `${anioActual}-${String(mesActual).padStart(2, "0")}`;
-    const ventasHoy = metricas.porDia[hoyISO] || { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 };
-    const ventasMes = metricas.porMes.find((m) => m.label === mesKey) || { volumen: 0, cantidad: 0 };
+    const metricas     = agruparVentas(ventas || [], hoyISO);
+    const mesKey       = `${anioActual}-${String(mesActual).padStart(2, "0")}`;
+    const ventasHoy    = metricas.porDia[hoyISO] || { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 };
+    const ventasMes    = metricas.porMes.find((m) => m.label === mesKey) || { volumen: 0, cantidad: 0 };
     const proximosDias = generarRangoDias(hoyISO, 7).map((fecha) => ({
       fecha,
       ...(metricas.porDia[fecha] || { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 }),
@@ -1208,35 +1200,43 @@ app.get("/admin-stats/:slug", async (req, res) => {
         businessName:   user.business_name,
         slug:           user.slug,
         agenda_url:     `${API_URL}/agenda?u=${user.slug}`,
+
         turnosHoy,
-        turnosMes: turnosMesTotal,
-        chartData: Object.keys(semanas).map((k) => ({ label: k, turnos: semanas[k] })),
+        turnosMes:   turnosMesTotal,
+        chartData:   Object.keys(semanas).map((k) => ({ label: k, turnos: semanas[k] })),
         turnosLista,
+
         ventas: {
-          volumenTotal: metricas.volumenTotal,
-          volumenHoy: ventasHoy.volumen,
-          volumenMes: ventasMes.volumen || 0,
+          volumenTotal:   metricas.volumenTotal,
+          volumenHoy:     ventasHoy.volumen,
+          volumenMes:     ventasMes.volumen || 0,
           ticketPromedio: metricas.ticketPromedio,
-          cantidadTotal: metricas.cantidadTotal,
-          cantidadHoy: ventasHoy.cantidad,
-          cantidadMes: ventasMes.cantidad || 0,
+          cantidadTotal:  metricas.cantidadTotal,
+          cantidadHoy:    ventasHoy.cantidad,
+          cantidadMes:    ventasMes.cantidad || 0,
           clientesNuevos: metricas.clientesNuevos,
           feeTotal,
-          estados: { aprobado: metricas.porEstado.aprobado || 0, pendiente: metricas.porEstado.pendiente || 0, rechazado: metricas.porEstado.rechazado || 0 },
+          estados: {
+            aprobado:  metricas.porEstado.aprobado  || 0,
+            pendiente: metricas.porEstado.pendiente || 0,
+            rechazado: metricas.porEstado.rechazado || 0,
+          },
         },
+
         ventasPorDia: metricas.porDia,
         ventasPorSem: metricas.porSemana,
         ventasPorMes: metricas.porMes,
         proximosDias,
+
         horarios: user.horarios,
         config: {
-          duracion: user.duracion_turno,
-          precio: user.precio,
-          monto_sena: user.monto_sena || 0,
-          metodo_pago: user.metodo_pago || "none",
-          mp_status: user.mp_access_token ? "Conectado" : "Desconectado",
-          mobbex_status: user.mobbex_api_key ? "Conectado" : "Desconectado",
-          excepciones: user.excepciones || [],
+          duracion:      user.duracion_turno,
+          precio:        user.precio,
+          monto_sena:    user.monto_sena  || 0,
+          metodo_pago:   user.metodo_pago || "none",
+          mp_status:     user.mp_access_token ? "Conectado" : "Desconectado",
+          mobbex_status: user.mobbex_api_key  ? "Conectado" : "Desconectado",
+          excepciones:   user.excepciones || [],
         },
       },
     };
@@ -1249,11 +1249,12 @@ app.get("/admin-stats/:slug", async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // SETTINGS
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /update-settings (protegido)
+// Body: { slug, precio?, horarios?, duracion_turno?, ocupados?, monto_sena?, metodo_pago? }
 app.post("/update-settings", requireAuth, async (req, res) => {
   try {
     const { slug, precio, horarios, duracion_turno, ocupados, monto_sena, metodo_pago } = req.body;
@@ -1264,12 +1265,12 @@ app.post("/update-settings", requireAuth, async (req, res) => {
     if (numPrecio < 0) return res.status(400).json({ success: false, error: "El precio no puede ser negativo." });
 
     const u = {
-      precio: numPrecio,
-      monto_sena: numSena,
-      metodo_pago: metodo_pago || "none",
+      precio:         numPrecio,
+      monto_sena:     numSena,
+      metodo_pago:    metodo_pago || "none",
       duracion_turno: parseInt(duracion_turno) || 30,
     };
-    if (horarios) u.horarios = horarios;
+    if (horarios) u.horarios    = horarios;
     if (ocupados) u.excepciones = ocupados;
 
     const { error } = await supabase.from("usuarios").update(u).eq("slug", cleanSlug);
@@ -1282,9 +1283,9 @@ app.post("/update-settings", requireAuth, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // 404 Y ERROR HANDLER
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 app.use("*", (req, res) => {
   res.status(404).json({ success: false, error: "Ruta no encontrada.", path: req.originalUrl });
@@ -1295,19 +1296,19 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, error: "Error interno del servidor." });
 });
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // ARRANQUE
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`
   ╔════════════════════════════════════════════╗
-  ║   NegoSocio API v4.2 — Online             ║
+  ║   NegoSocio API v4.1 — Online             ║
   ║   Identificador: SLUG                     ║
   ║   Comisión plataforma: 2.5%               ║
   ║   Pasarelas: Mobbex + Mercado Pago        ║
-  ║   ✅ FIX: /slots-disponibles valida BD    ║
+  ║   Nuevo endpoint: GET /negocio/:slug      ║
   ║   Puerto: ${PORT}                           ║
   ╚════════════════════════════════════════════╝
   `);
