@@ -16,22 +16,22 @@ const APPS_SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbzvcaYhHuyD-Xu63Aw9WpWrpcr5xmrgHW_IffXkmC90bs0pTzhWP1d8rWBaBuhG5Icx/exec";
 
 const BCRYPT_ROUNDS  = 10;
-const CACHE_DURATION = 20_000;           // ms — caché de admin-stats
-const JWT_EXPIRY     = "7d";             // tokens duran 7 días
+const CACHE_DURATION = 20_000;       // ms — caché de admin-stats
+const JWT_EXPIRY     = "7d";
 const API_URL        = process.env.API_URL || "https://negosocio.onrender.com";
-
-// Comisión que cobramos a los negocios sobre el precio TOTAL del servicio
-// Podés ajustar esto a una tarifa única ya que no hay planes
-const FEE_RATE = Number(process.env.FEE_RATE || 0.025);  // 2.5% por defecto
 
 // ══════════════════════════════════════════════════════════════
 // HELPERS GENERALES
 // ══════════════════════════════════════════════════════════════
-const getCleanSlug = (raw) => {
+
+// Normaliza un dominio: minúsculas, sin protocolo ni trailing slash
+// "Https://MiTurno.com/" → "miturno.com"
+const cleanDominio = (raw) => {
   if (!raw) return "";
   return raw.toLowerCase().trim()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "")
+    .trim();
 };
 
 const validateEmail    = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
@@ -43,7 +43,7 @@ const cleanPhone       = (p) => p.toString().replace(/\s/g, "").trim();
 // CACHÉ EN MEMORIA
 // ══════════════════════════════════════════════════════════════
 const globalCache = {};
-const invalidateCache = (slug) => { delete globalCache[slug]; };
+const invalidateCache = (dominio) => { delete globalCache[dominio]; };
 
 // ══════════════════════════════════════════════════════════════
 // RATE LIMITING
@@ -71,8 +71,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 // ══════════════════════════════════════════════════════════════
 // MIDDLEWARE: JWT AUTH
 // ══════════════════════════════════════════════════════════════
-// El JWT contiene: { slug, negocioId, rol: "owner" | "superadmin" }
-// Se genera en /login y se verifica en cada ruta protegida.
+// JWT contiene: { dominio, negocioId, rol: "owner" | "superadmin" }
 function requireAuth(req, res, next) {
   try {
     const header = req.headers["authorization"];
@@ -86,18 +85,18 @@ function requireAuth(req, res, next) {
 
     const payload = jwt.verify(token, secret);
 
-    // Si es superadmin, pasa directo sin verificar el slug de la ruta
+    // Superadmin: acceso total
     if (payload.rol === "superadmin") {
       req.auth = payload;
       return next();
     }
 
-    // Para owners: el slug del JWT debe coincidir con el slug de la ruta/body
-    const slugRuta = getCleanSlug(
-      req.params.slug || req.body?.slug || req.query?.slug || ""
+    // Owner: el dominio del JWT debe coincidir con el dominio de la ruta/body
+    const dominioRuta = cleanDominio(
+      req.params.dominio || req.body?.dominio || req.query?.dominio || ""
     );
 
-    if (slugRuta && payload.slug !== slugRuta) {
+    if (dominioRuta && payload.dominio !== dominioRuta) {
       return res.status(403).json({ success: false, error: "No autorizado para este negocio." });
     }
 
@@ -123,13 +122,6 @@ const requireAdminKey = (req, res, next) => {
 };
 
 // ══════════════════════════════════════════════════════════════
-// HELPER: COMISIÓN
-// ══════════════════════════════════════════════════════════════
-function calcularServiceFee(precioTotalServicio) {
-  return Math.round(Number(precioTotalServicio) * FEE_RATE);
-}
-
-// ══════════════════════════════════════════════════════════════
 // HELPERS DE MÉTRICAS
 // ══════════════════════════════════════════════════════════════
 function generarRangoDias(desdeISO, cantidad) {
@@ -149,20 +141,19 @@ function agruparVentas(ventas, hoyISO) {
   const porMes    = {};
   const porEstado = { aprobado: 0, pendiente: 0, rechazado: 0 };
   const clientesSet = new Set();
-  let volumenTotal = 0, cantidadTotal = 0, feeTotal = 0;
+  let volumenTotal = 0, cantidadTotal = 0;
 
   ventas.forEach((v) => {
     const fecha  = (v.fecha_pago || v.created_at || hoyISO).split("T")[0];
-    const monto  = Number(v.monto   || 0);
-    const fee    = Number(v.service_fee || 0);
+    const monto  = Number(v.monto || 0);
     const estado = v.estado || "aprobado";
     const [va, vm, vd] = fecha.split("-").map(Number);
     const semKey = `${va}-S${Math.ceil(vd / 7)}`;
     const mesKey = `${va}-${String(vm).padStart(2, "0")}`;
 
-    if (!porDia[fecha])    porDia[fecha]    = { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 };
+    if (!porDia[fecha])     porDia[fecha]     = { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 };
     if (!porSemana[semKey]) porSemana[semKey] = { label: semKey, volumen: 0, cantidad: 0 };
-    if (!porMes[mesKey])   porMes[mesKey]   = { label: mesKey, volumen: 0, cantidad: 0 };
+    if (!porMes[mesKey])    porMes[mesKey]    = { label: mesKey, volumen: 0, cantidad: 0 };
 
     porDia[fecha].volumen  += monto;
     porDia[fecha].cantidad += 1;
@@ -170,19 +161,17 @@ function agruparVentas(ventas, hoyISO) {
 
     porSemana[semKey].volumen  += monto;
     porSemana[semKey].cantidad += 1;
-
-    porMes[mesKey].volumen  += monto;
-    porMes[mesKey].cantidad += 1;
+    porMes[mesKey].volumen     += monto;
+    porMes[mesKey].cantidad    += 1;
 
     porEstado[estado] = (porEstado[estado] || 0) + 1;
 
-    if (v.email_cliente)    clientesSet.add(v.email_cliente.toLowerCase());
+    if (v.email_cliente)         clientesSet.add(v.email_cliente.toLowerCase());
     else if (v.telefono_cliente) clientesSet.add(v.telefono_cliente);
 
     if (estado === "aprobado") {
       volumenTotal  += monto;
       cantidadTotal += 1;
-      feeTotal      += fee;
     }
   });
 
@@ -193,8 +182,6 @@ function agruparVentas(ventas, hoyISO) {
     porEstado,
     volumenTotal,
     cantidadTotal,
-    feeTotal,
-    volumenNeto:    volumenTotal - feeTotal,
     ticketPromedio: cantidadTotal > 0 ? Math.round(volumenTotal / cantidadTotal) : 0,
     clientesNuevos: clientesSet.size,
   };
@@ -209,98 +196,110 @@ function calcularFrecuencia(cantidadTurnos) {
 // ══════════════════════════════════════════════════════════════
 // RUTAS BASE
 // ══════════════════════════════════════════════════════════════
-app.get("/",       (_, res) => res.json({ status: "online", version: "6.0", timestamp: new Date().toISOString() }));
+app.get("/",       (_, res) => res.json({ status: "online", version: "7.0", timestamp: new Date().toISOString() }));
 app.get("/health", (_, res) => res.json({ status: "ok",     timestamp: new Date().toISOString() }));
 
 
 // ══════════════════════════════════════════════════════════════
 // SUPERADMIN — CRUD DE NEGOCIOS
+// Protegido por x-api-key (ADMIN_SECRET en .env)
 // ══════════════════════════════════════════════════════════════
 
 /**
- * POST /admin/negocios
- * Crea un negocio nuevo. Solo accesible con x-api-key.
- * Body: { business_name, slug, email, password, nombre_persona, last_name?,
- *          precio?, duracion_turno?, telefono?, rubro? }
+ * POST /superadmin/negocios
+ * Registra un negocio nuevo. Solo accesible con x-api-key.
+ * Body: {
+ *   nombre_persona, apellido, email, telefono,   ← datos del propietario
+ *   business_name, dominio,                       ← datos del negocio
+ *   password, rubro?                              ← acceso y clasificación
+ * }
  */
-app.post("/admin/negocios", requireAdminKey, async (req, res) => {
+app.post("/superadmin/negocios", requireAdminKey, async (req, res) => {
   try {
     const {
-      business_name, slug, email, password,
-      nombre_persona, last_name,
-      precio, duracion_turno, telefono,
+      nombre_persona, apellido, email, telefono,
+      business_name, dominio,
+      password,
       rubro = "generico",
     } = req.body;
 
-    if (!business_name || !slug || !email || !password) {
-      return res.status(400).json({ success: false, error: "Faltan campos: business_name, slug, email, password." });
+    // Validaciones obligatorias
+    if (!nombre_persona || !email || !password || !business_name || !dominio) {
+      return res.status(400).json({
+        success: false,
+        error: "Faltan campos obligatorios: nombre_persona, email, password, business_name, dominio.",
+      });
     }
-    if (!validateEmail(email))       return res.status(400).json({ success: false, error: "Email inválido." });
-    if (!validatePassword(password)) return res.status(400).json({ success: false, error: "Contraseña mínimo 6 caracteres." });
+    if (!validateEmail(email))        return res.status(400).json({ success: false, error: "Email inválido." });
+    if (!validatePassword(password))  return res.status(400).json({ success: false, error: "Contraseña: mínimo 6 caracteres." });
+    if (telefono && !validatePhone(cleanPhone(telefono))) {
+      return res.status(400).json({ success: false, error: "Teléfono inválido." });
+    }
 
-    const cleanSlug      = getCleanSlug(slug);
+    const dominioClean   = cleanDominio(dominio);
     const hashedPassword = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
 
     const { data, error } = await supabase.from("usuarios").insert([{
-      business_name:  business_name.trim(),
-      slug:           cleanSlug,
-      email:          email.trim().toLowerCase(),
-      password:       hashedPassword,
-      nombre_persona: nombre_persona?.trim() || "Dueño",
-      last_name:      last_name?.trim() || "",
-      precio:         parseInt(precio) || 0,
-      duracion_turno: parseInt(duracion_turno) || 30,
-      telefono:       telefono || null,
-      metodo_pago:    "none",
-      excepciones:    [],
+      nombre_persona:  nombre_persona.trim(),
+      apellido:        apellido?.trim() || "",
+      email:           email.trim().toLowerCase(),
+      telefono:        telefono ? cleanPhone(telefono) : null,
+      business_name:   business_name.trim(),
+      dominio:         dominioClean,
+      password:        hashedPassword,
       rubro,
-      activo:         true,
-    }]).select("id, slug, business_name, rubro, email").single();
+      metodo_pago:     "none",
+      porcentaje_sena: 30,
+      excepciones:     [],
+      activo:          true,
+    }]).select("id, dominio, business_name, rubro, email, nombre_persona, apellido").single();
 
     if (error) {
-      if (error.code === "23505") return res.status(409).json({ success: false, error: "El slug o email ya existe." });
+      if (error.code === "23505") {
+        return res.status(409).json({ success: false, error: "El dominio o email ya están registrados." });
+      }
       throw error;
     }
 
-    console.log(`✅ Negocio creado: ${cleanSlug} (${rubro})`);
+    console.log(`✅ Negocio creado: ${dominioClean} (${rubro})`);
     res.status(201).json({
       success:    true,
       negocio:    data,
-      agenda_url: `${API_URL}/agenda?u=${cleanSlug}`,
+      panel_url:  `${process.env.PANEL_URL || "https://negosocio.framer.website/panel"}?u=${dominioClean}`,
     });
   } catch (e) {
-    console.error("Error en POST /admin/negocios:", e.message);
+    console.error("Error en POST /superadmin/negocios:", e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
 /**
- * GET /admin/negocios
- * Lista todos los negocios (vista resumida).
+ * GET /superadmin/negocios
+ * Lista todos los negocios con resumen.
  */
-app.get("/admin/negocios", requireAdminKey, async (req, res) => {
+app.get("/superadmin/negocios", requireAdminKey, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("usuarios")
-      .select("id, slug, business_name, rubro, nombre_persona, last_name, email, telefono, activo, metodo_pago, precio, mp_access_token, mobbex_api_key")
+      .select("id, dominio, business_name, rubro, nombre_persona, apellido, email, telefono, activo, metodo_pago, mp_access_token, mobbex_api_key, created_at")
       .order("business_name", { ascending: true });
 
     if (error) throw error;
 
     const negocios = (data || []).map((u) => ({
-      id:            u.id,
-      slug:          u.slug,
-      business_name: u.business_name,
-      rubro:         u.rubro,
+      id:             u.id,
+      dominio:        u.dominio,
+      business_name:  u.business_name,
+      rubro:          u.rubro,
       nombre_persona: u.nombre_persona,
-      last_name:     u.last_name,
-      email:         u.email,
-      telefono:      u.telefono,
-      activo:        u.activo,
-      metodo_pago:   u.metodo_pago,
-      precio:        u.precio,
-      tiene_mp:      !!u.mp_access_token,
-      tiene_mobbex:  !!u.mobbex_api_key,
+      apellido:       u.apellido,
+      email:          u.email,
+      telefono:       u.telefono,
+      activo:         u.activo,
+      metodo_pago:    u.metodo_pago,
+      tiene_mp:       !!u.mp_access_token,
+      tiene_mobbex:   !!u.mobbex_api_key,
+      creado:         u.created_at,
     }));
 
     res.json({ success: true, negocios, total: negocios.length });
@@ -310,26 +309,72 @@ app.get("/admin/negocios", requireAdminKey, async (req, res) => {
 });
 
 /**
- * PUT /admin/negocios/:slug
+ * GET /superadmin/negocios/:dominio
+ * Detalle completo de un negocio (para el panel superadmin).
+ */
+app.get("/superadmin/negocios/:dominio", requireAdminKey, async (req, res) => {
+  try {
+    const dominio = cleanDominio(req.params.dominio);
+    const { data: negocio, error } = await supabase
+      .from("usuarios")
+      .select("id, dominio, business_name, rubro, nombre_persona, apellido, email, telefono, activo, metodo_pago, porcentaje_sena, quien_asume_comision, duracion_turno, capacidad_por_turno, horarios, excepciones, notas_internas, mp_access_token, mobbex_api_key, created_at")
+      .eq("dominio", dominio).single();
+
+    if (error || !negocio) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+
+    // Servicios del negocio
+    const { data: servicios } = await supabase
+      .from("servicios").select("id, nombre, descripcion, precio, duracion, capacidad, activo, orden")
+      .eq("dominio", dominio).order("orden", { ascending: true });
+
+    res.json({
+      success: true,
+      negocio: {
+        ...negocio,
+        tiene_mp:     !!negocio.mp_access_token,
+        tiene_mobbex: !!negocio.mobbex_api_key,
+        // No devolver tokens reales
+        mp_access_token:      undefined,
+        mobbex_api_key:       undefined,
+        mobbex_access_token:  undefined,
+      },
+      servicios: servicios || [],
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * PUT /superadmin/negocios/:dominio
  * Edita datos de un negocio existente.
  */
-app.put("/admin/negocios/:slug", requireAdminKey, async (req, res) => {
+app.put("/superadmin/negocios/:dominio", requireAdminKey, async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
-    const allowed = ["business_name","nombre_persona","last_name","email","telefono","rubro","activo","precio","duracion_turno","notas_internas"];
-    const update  = {};
+    const dominio = cleanDominio(req.params.dominio);
+    const allowed = [
+      "nombre_persona", "apellido", "email", "telefono",
+      "business_name", "rubro", "activo", "notas_internas",
+      "duracion_turno", "capacidad_por_turno",
+    ];
+    const update = {};
 
     allowed.forEach((key) => {
       if (req.body[key] !== undefined) update[key] = req.body[key];
     });
 
+    // Si cambia el dominio (con cuidado)
+    if (req.body.nuevo_dominio) {
+      update.dominio = cleanDominio(req.body.nuevo_dominio);
+    }
+
     if (req.body.password) {
       update.password = await bcrypt.hash(String(req.body.password), BCRYPT_ROUNDS);
     }
 
-    const { error } = await supabase.from("usuarios").update(update).eq("slug", slug);
+    const { error } = await supabase.from("usuarios").update(update).eq("dominio", dominio);
     if (error) throw error;
-    invalidateCache(slug);
+    invalidateCache(dominio);
 
     res.json({ success: true });
   } catch (e) {
@@ -338,16 +383,16 @@ app.put("/admin/negocios/:slug", requireAdminKey, async (req, res) => {
 });
 
 /**
- * DELETE /admin/negocios/:slug
+ * DELETE /superadmin/negocios/:dominio
  * Desactiva (soft delete) un negocio.
  */
-app.delete("/admin/negocios/:slug", requireAdminKey, async (req, res) => {
+app.delete("/superadmin/negocios/:dominio", requireAdminKey, async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
-    const { error } = await supabase.from("usuarios").update({ activo: false }).eq("slug", slug);
+    const dominio = cleanDominio(req.params.dominio);
+    const { error } = await supabase.from("usuarios").update({ activo: false }).eq("dominio", dominio);
     if (error) throw error;
-    invalidateCache(slug);
-    res.json({ success: true, message: `Negocio ${slug} desactivado.` });
+    invalidateCache(dominio);
+    res.json({ success: true, message: `Negocio ${dominio} desactivado.` });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -360,46 +405,47 @@ app.delete("/admin/negocios/:slug", requireAdminKey, async (req, res) => {
 
 /**
  * POST /login
- * Body: { slug, password }
- * Devuelve un JWT firmado con { slug, negocioId, rol: "owner" }
+ * Body: { dominio, password }
+ * El dueño del negocio se loguea con su dominio y contraseña.
  */
 app.post("/login", limiterAuth, async (req, res) => {
   try {
-    const slug     = getCleanSlug(req.body.slug);
+    const dominio  = cleanDominio(req.body.dominio || req.body.slug); // slug como alias temporal
     const password = req.body.password;
 
-    if (!slug || !password) return res.status(400).json({ success: false, error: "Faltan slug o contraseña." });
+    if (!dominio || !password) {
+      return res.status(400).json({ success: false, error: "Faltan dominio y contraseña." });
+    }
 
     const { data: user, error } = await supabase
       .from("usuarios")
-      .select("id, slug, password, business_name, nombre_persona, last_name, email, rubro, activo")
-      .eq("slug", slug)
+      .select("id, dominio, password, business_name, nombre_persona, apellido, email, rubro, activo")
+      .eq("dominio", dominio)
       .single();
 
     if (error || !user) return res.status(401).json({ success: false, error: "Credenciales incorrectas." });
     if (!user.activo)   return res.status(403).json({ success: false, error: "Este negocio está desactivado." });
 
     // Soporte para contraseñas viejas sin hash (migración progresiva)
-    const isHashed  = user.password?.startsWith("$2b$") || user.password?.startsWith("$2a$");
-    let passwordOk  = false;
+    const isHashed = user.password?.startsWith("$2b$") || user.password?.startsWith("$2a$");
+    let passwordOk = false;
     if (isHashed) {
       passwordOk = await bcrypt.compare(String(password), user.password);
     } else {
       passwordOk = String(user.password) === String(password);
       if (passwordOk) {
         const newHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
-        await supabase.from("usuarios").update({ password: newHash }).eq("slug", slug);
-        console.log(`🔐 Contraseña migrada a bcrypt: ${slug}`);
+        await supabase.from("usuarios").update({ password: newHash }).eq("dominio", dominio);
       }
     }
 
     if (!passwordOk) return res.status(401).json({ success: false, error: "Credenciales incorrectas." });
 
-    const secret  = process.env.JWT_SECRET;
+    const secret = process.env.JWT_SECRET;
     if (!secret)  return res.status(500).json({ success: false, error: "JWT_SECRET no configurado." });
 
     const token = jwt.sign(
-      { slug: user.slug, negocioId: user.id, rol: "owner" },
+      { dominio: user.dominio, negocioId: user.id, rol: "owner" },
       secret,
       { expiresIn: JWT_EXPIRY }
     );
@@ -407,13 +453,12 @@ app.post("/login", limiterAuth, async (req, res) => {
     res.json({
       success:        true,
       token,
-      slug:           user.slug,
+      dominio:        user.dominio,
       business_name:  user.business_name,
       nombre_persona: user.nombre_persona,
-      last_name:      user.last_name || "",
+      apellido:       user.apellido || "",
       email:          user.email,
       rubro:          user.rubro,
-      agenda_url:     `${API_URL}/agenda?u=${user.slug}`,
     });
   } catch (e) {
     console.error("Error en /login:", e.message);
@@ -423,25 +468,24 @@ app.post("/login", limiterAuth, async (req, res) => {
 
 /**
  * GET /verify-session
- * Valida el JWT y devuelve datos básicos del negocio.
  */
 app.get("/verify-session", requireAuth, async (req, res) => {
   try {
     const { data: user } = await supabase
       .from("usuarios")
-      .select("slug, business_name, email, nombre_persona, last_name, rubro, activo")
-      .eq("slug", req.auth.slug)
+      .select("dominio, business_name, email, nombre_persona, apellido, rubro, activo")
+      .eq("dominio", req.auth.dominio)
       .single();
 
     if (!user || !user.activo) return res.json({ active: false, reason: "not_found" });
 
     res.json({
-      active: true,
-      slug:           user.slug,
+      active:         true,
+      dominio:        user.dominio,
       business_name:  user.business_name,
       email:          user.email,
       nombre_persona: user.nombre_persona,
-      last_name:      user.last_name || "",
+      apellido:       user.apellido || "",
       rubro:          user.rubro,
     });
   } catch (e) {
@@ -451,15 +495,14 @@ app.get("/verify-session", requireAuth, async (req, res) => {
 
 /**
  * POST /api/request-password-reset
- * Flujo de reset por email (igual que v5, via Google Apps Script)
  */
 app.post("/api/request-password-reset", limiterAuth, async (req, res) => {
   try {
     const { email, newPassword } = req.body;
-    if (!email || !newPassword)        return res.status(400).json({ success: false, error: "Faltan datos." });
+    if (!email || !newPassword)         return res.status(400).json({ success: false, error: "Faltan datos." });
     if (!validatePassword(newPassword)) return res.status(400).json({ success: false, error: "Mínimo 6 caracteres." });
 
-    const { data: user } = await supabase.from("usuarios").select("slug").eq("email", email.trim().toLowerCase()).single();
+    const { data: user } = await supabase.from("usuarios").select("dominio").eq("email", email.trim().toLowerCase()).single();
     if (!user) return res.json({ success: true }); // silencioso por seguridad
 
     const googleRes = await fetch(APPS_SCRIPT_URL, {
@@ -497,22 +540,23 @@ app.post("/api/verify-and-reset-password", limiterAuth, async (req, res) => {
 
 
 // ══════════════════════════════════════════════════════════════
-// NEGOCIO PÚBLICO (para la landing)
+// NEGOCIO PÚBLICO (para la landing del cliente)
 // ══════════════════════════════════════════════════════════════
 
 /**
- * GET /negocio/:slug
- * Devuelve datos públicos del negocio para mostrar en la landing.
+ * GET /negocio/:dominio
+ * Devuelve datos públicos del negocio para la landing.
+ * El frontend puede llamar con el dominio de la URL (window.location.hostname).
  */
-app.get("/negocio/:slug", async (req, res) => {
+app.get("/negocio/:dominio", async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
-    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+    const dominio = cleanDominio(req.params.dominio);
+    if (!dominio) return res.status(400).json({ success: false, error: "Dominio inválido." });
 
     const { data: user, error } = await supabase
       .from("usuarios")
-      .select("slug, business_name, rubro, horarios, excepciones, duracion_turno, capacidad_por_turno, metodo_pago, monto_sena, precio, mp_access_token, mobbex_api_key, quien_asume_comision, activo")
-      .eq("slug", slug)
+      .select("dominio, business_name, rubro, horarios, excepciones, duracion_turno, capacidad_por_turno, metodo_pago, porcentaje_sena, mp_access_token, mobbex_api_key, quien_asume_comision, activo")
+      .eq("dominio", dominio)
       .single();
 
     if (error || !user)  return res.status(404).json({ success: false, error: "Negocio no encontrado." });
@@ -521,18 +565,17 @@ app.get("/negocio/:slug", async (req, res) => {
     res.json({
       success: true,
       negocio: {
-        slug:                user.slug,
-        business_name:       user.business_name,
-        rubro:               user.rubro,
-        horarios:            user.horarios || {},
-        excepciones:         user.excepciones || [],
-        duracion_turno:      user.duracion_turno || 30,
-        capacidad_por_turno: user.capacidad_por_turno || 1,
-        metodo_pago:         user.metodo_pago || "none",
-        monto_sena:          user.monto_sena || 0,
-        precio:              user.precio || 0,
-        tiene_mp:            !!user.mp_access_token,
-        tiene_mobbex:        !!user.mobbex_api_key,
+        dominio:              user.dominio,
+        business_name:        user.business_name,
+        rubro:                user.rubro,
+        horarios:             user.horarios || {},
+        excepciones:          user.excepciones || [],
+        duracion_turno:       user.duracion_turno || 30,
+        capacidad_por_turno:  user.capacidad_por_turno || 1,
+        metodo_pago:          user.metodo_pago || "none",
+        porcentaje_sena:      user.porcentaje_sena || 30,
+        tiene_mp:             !!user.mp_access_token,
+        tiene_mobbex:         !!user.mobbex_api_key,
         quien_asume_comision: user.quien_asume_comision || "cliente",
       },
     });
@@ -547,35 +590,52 @@ app.get("/negocio/:slug", async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 
 /**
- * GET /slots-disponibles/:slug?fecha=YYYY-MM-DD&servicio_id=...
+ * GET /slots-disponibles/:dominio?fecha=YYYY-MM-DD&servicio_id=...
+ * Si se pasa servicio_id, usa la duración y capacidad de ese servicio.
  */
-app.get("/slots-disponibles/:slug", async (req, res) => {
+app.get("/slots-disponibles/:dominio", async (req, res) => {
   try {
-    const slug                   = getCleanSlug(req.params.slug);
+    const dominio                = cleanDominio(req.params.dominio);
     const { fecha, servicio_id } = req.query;
 
-    if (!slug || !fecha) return res.status(400).json({ success: false, error: "Faltan slug o fecha." });
+    if (!dominio || !fecha) return res.status(400).json({ success: false, error: "Faltan dominio o fecha." });
 
     const { data: user, error: userError } = await supabase
       .from("usuarios")
       .select("horarios, duracion_turno, capacidad_por_turno, excepciones, activo")
-      .eq("slug", slug)
+      .eq("dominio", dominio)
       .single();
 
-    if (userError || !user || !user.activo) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+    if (userError || !user || !user.activo) {
+      return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+    }
 
-    let duracion = user.duracion_turno || 30;
-    let capacidad = user.capacidad_por_turno || 1;
+    // Por defecto toma la configuración global del negocio
+    let duracion  = user.duracion_turno       || 30;
+    let capacidad = user.capacidad_por_turno  || 1;
 
+    // Si se especificó un servicio, usar SU duración y capacidad
     if (servicio_id) {
-      const { data: srv } = await supabase.from("servicios").select("duracion, capacidad").eq("id", servicio_id).eq("slug", slug).single();
+      const { data: srv } = await supabase
+        .from("servicios")
+        .select("duracion, capacidad")
+        .eq("id", servicio_id)
+        .eq("dominio", dominio)
+        .single();
       if (srv) {
         duracion  = srv.duracion  || duracion;
         capacidad = srv.capacidad || capacidad;
       }
     }
 
-    if (user.excepciones?.includes(fecha)) return res.json({ success: true, slots: [] });
+    // Excepciones: día completamente bloqueado
+    const excepcionesArr = user.excepciones || [];
+    const estaExceptuado = Array.isArray(excepcionesArr)
+      ? excepcionesArr.some((e) =>
+          typeof e === "string" ? e === fecha : e?.fecha === fecha && e?.type === "block"
+        )
+      : false;
+    if (estaExceptuado) return res.json({ success: true, slots: [] });
 
     const diasSemana = ["domingo", "lunes", "martes", "miercoles", "jueves", "viernes", "sabado"];
     const diaConfig  = user.horarios?.[diasSemana[new Date(fecha + "T12:00:00").getDay()]];
@@ -599,7 +659,7 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
     const { data: turnosDia } = await supabase
       .from("turnos")
       .select("hora, estado")
-      .eq("slug", slug).eq("fecha", fecha)
+      .eq("dominio", dominio).eq("fecha", fecha)
       .in("estado", ["confirmado", "pendiente"]);
 
     const reservasPorSlot = {};
@@ -626,15 +686,15 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 
 /**
- * GET /turnos/ocupados?slug=...&fecha=...
+ * GET /turnos/ocupados?dominio=...&fecha=...
  */
 app.get("/turnos/ocupados", async (req, res) => {
   try {
-    const slug  = getCleanSlug(req.query.slug);
-    const fecha = req.query.fecha;
-    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+    const dominio = cleanDominio(req.query.dominio || req.query.slug);
+    const fecha   = req.query.fecha;
+    if (!dominio) return res.status(400).json({ success: false, error: "Dominio inválido." });
 
-    let q = supabase.from("turnos").select("hora").eq("slug", slug).neq("estado", "cancelado");
+    let q = supabase.from("turnos").select("hora").eq("dominio", dominio).neq("estado", "cancelado");
     if (fecha) q = q.eq("fecha", fecha);
 
     const { data, error } = await q;
@@ -649,13 +709,13 @@ app.get("/turnos/ocupados", async (req, res) => {
 /**
  * POST /turnos/reservar
  * El cliente reserva desde la landing (sin login).
- * Body: { slug, name, phone, email?, fecha, hora, servicio_id? }
+ * Body: { dominio, name, phone, email?, fecha, hora, servicio_id? }
  */
 app.post("/turnos/reservar", limiterBooking, async (req, res) => {
   try {
-    const { name, phone, email, fecha, hora, slug, servicio_id } = req.body;
+    const { name, phone, email, fecha, hora, dominio, servicio_id } = req.body;
 
-    if (!name || !phone || !fecha || !hora || !slug) {
+    if (!name || !phone || !fecha || !hora || !dominio) {
       return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
     }
 
@@ -667,42 +727,56 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       return res.status(400).json({ success: false, error: "Email inválido." });
     }
 
-    const cleanSlug = getCleanSlug(slug);
-    const { data: user, error: userError } = await supabase.from("usuarios").select("*").eq("slug", cleanSlug).single();
+    const dominioClean = cleanDominio(dominio);
+    const { data: user, error: userError } = await supabase
+      .from("usuarios").select("*").eq("dominio", dominioClean).single();
     if (userError || !user)  return res.status(404).json({ success: false, error: "Negocio no encontrado." });
     if (!user.activo)        return res.status(404).json({ success: false, error: "Negocio no disponible." });
 
-    // Si requiere pago, no se puede crear sin payment flow
-    const requierePago = (user.mp_access_token || user.mobbex_api_key) && (user.metodo_pago === "sena" || user.metodo_pago === "total");
-    if (requierePago) return res.status(403).json({ success: false, error: "Este turno requiere pago previo." });
+    // Si requiere pago previo, rechazar reserva directa
+    const requierePago = (user.mp_access_token || user.mobbex_api_key)
+      && (user.metodo_pago === "sena" || user.metodo_pago === "total");
+    if (requierePago) {
+      return res.status(403).json({ success: false, error: "Este turno requiere pago previo." });
+    }
 
-    // Anti-duplicado: mismo teléfono o email con turno futuro activo
+    // Anti-duplicado
     const hoy = new Date().toISOString().split("T")[0];
     const { data: turnosExistentes } = await supabase
       .from("turnos").select("id")
-      .eq("slug", cleanSlug).gte("fecha", hoy).neq("estado", "cancelado")
+      .eq("dominio", dominioClean).gte("fecha", hoy).neq("estado", "cancelado")
       .or(`telefono.eq.${phoneClean}${email ? `,email.eq.${email.trim().toLowerCase()}` : ""}`);
 
     if (turnosExistentes?.length > 0) {
       return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
     }
 
-    // Verificar capacidad
-    const capacidad = user.capacidad_por_turno || 1;
+    // Capacidad
+    let capacidad = user.capacidad_por_turno || 1;
+    let servicioNombre = null;
+    let precioCobrado  = 0;
+
+    if (servicio_id) {
+      const { data: srv } = await supabase
+        .from("servicios").select("nombre, capacidad, precio")
+        .eq("id", servicio_id).single();
+      if (srv) {
+        servicioNombre = srv.nombre;
+        capacidad      = srv.capacidad || capacidad;
+        precioCobrado  = Number(srv.precio || 0);
+      }
+    }
+
     const { count } = await supabase.from("turnos")
       .select("id", { count: "exact" })
-      .eq("slug", cleanSlug).eq("fecha", fecha).eq("hora", hora).neq("estado", "cancelado");
+      .eq("dominio", dominioClean).eq("fecha", fecha).eq("hora", hora).neq("estado", "cancelado");
 
-    if (count >= capacidad) return res.status(400).json({ success: false, error: "Este turno ya está lleno." });
-
-    let servicioNombre = null;
-    if (servicio_id) {
-      const { data: srv } = await supabase.from("servicios").select("nombre").eq("id", servicio_id).single();
-      servicioNombre = srv?.nombre || null;
+    if (count >= capacidad) {
+      return res.status(400).json({ success: false, error: "Este turno ya está lleno." });
     }
 
     const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
-      slug:            cleanSlug,
+      dominio:         dominioClean,
       nombre:          name.trim(),
       telefono:        phoneClean,
       email:           email?.trim().toLowerCase() || null,
@@ -710,13 +784,14 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       hora,
       servicio_id:     servicio_id || null,
       servicio_nombre: servicioNombre,
+      precio_cobrado:  precioCobrado,
       estado:          "confirmado",
       metodo_pago:     "none",
     }]).select().single();
 
     if (turnoError) throw turnoError;
 
-    // Notificación al dueño
+    // Notificación email al dueño
     fetch(APPS_SCRIPT_URL, {
       method: "POST", headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({
@@ -728,7 +803,7 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       }),
     }).catch((e) => console.error("Error mail booking:", e.message));
 
-    invalidateCache(cleanSlug);
+    invalidateCache(dominioClean);
     res.json({ success: true, turno_id: turno.id, message: "Turno creado con éxito." });
   } catch (e) {
     console.error("Error en /turnos/reservar:", e.message);
@@ -738,15 +813,13 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
 
 /**
  * PUT /turnos/:id
- * El dueño actualiza el estado de un turno (confirmar, cancelar, completar, no_asistio).
- * También puede editar notas.
- * Requiere JWT del dueño.
+ * El dueño actualiza estado o notas de un turno.
  */
 app.put("/turnos/:id", requireAuth, async (req, res) => {
   try {
-    const { id }   = req.params;
-    const { estado, notas, slug } = req.body;
-    const cleanSlug = getCleanSlug(slug || req.auth.slug);
+    const { id }     = req.params;
+    const { estado, notas, dominio } = req.body;
+    const dominioClean = cleanDominio(dominio || req.auth.dominio);
 
     const estadosValidos = ["confirmado", "pendiente", "cancelado", "completado", "no_asistio"];
     if (estado && !estadosValidos.includes(estado)) {
@@ -758,28 +831,11 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
     if (notas  !== undefined) update.notas  = notas;
 
     const { data, error } = await supabase
-      .from("turnos").update(update).eq("id", id).eq("slug", cleanSlug).select().single();
+      .from("turnos").update(update).eq("id", id).eq("dominio", dominioClean).select().single();
 
     if (error) throw error;
-
-    invalidateCache(cleanSlug);
+    invalidateCache(dominioClean);
     res.json({ success: true, turno: data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Alias de compatibilidad con v5
-app.post("/cancel-appointment", requireAuth, async (req, res) => {
-  try {
-    const { slug, turno_id } = req.body;
-    const cleanSlug = getCleanSlug(slug);
-    if (!turno_id) return res.status(400).json({ success: false, error: "Falta el turno_id." });
-
-    const { error } = await supabase.from("turnos").update({ estado: "cancelado" }).eq("id", turno_id).eq("slug", cleanSlug);
-    if (error) throw error;
-    invalidateCache(cleanSlug);
-    res.json({ success: true, message: "Turno cancelado." });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -790,15 +846,16 @@ app.post("/cancel-appointment", requireAuth, async (req, res) => {
 // SERVICIOS
 // ══════════════════════════════════════════════════════════════
 
-/** GET /servicios/:slug — público, para la landing */
-app.get("/servicios/:slug", async (req, res) => {
+/** GET /servicios/:dominio — público, para la landing */
+app.get("/servicios/:dominio", async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
-    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+    const dominio = cleanDominio(req.params.dominio);
+    if (!dominio) return res.status(400).json({ success: false, error: "Dominio inválido." });
 
     const { data, error } = await supabase
-      .from("servicios").select("id, nombre, descripcion, duracion, precio, capacidad")
-      .eq("slug", slug).eq("activo", true)
+      .from("servicios")
+      .select("id, nombre, descripcion, duracion, precio, capacidad")
+      .eq("dominio", dominio).eq("activo", true)
       .order("orden", { ascending: true })
       .order("created_at", { ascending: true });
 
@@ -809,12 +866,12 @@ app.get("/servicios/:slug", async (req, res) => {
   }
 });
 
-/** GET /admin/servicios/:slug — lista completa (con inactivos) */
-app.get("/admin/servicios/:slug", requireAuth, async (req, res) => {
+/** GET /admin/servicios/:dominio — lista completa (con inactivos) */
+app.get("/admin/servicios/:dominio", requireAuth, async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
+    const dominio = cleanDominio(req.params.dominio);
     const { data, error } = await supabase
-      .from("servicios").select("*").eq("slug", slug)
+      .from("servicios").select("*").eq("dominio", dominio)
       .order("orden", { ascending: true })
       .order("created_at", { ascending: true });
 
@@ -828,15 +885,15 @@ app.get("/admin/servicios/:slug", requireAuth, async (req, res) => {
 /** POST /admin/servicios — crear */
 app.post("/admin/servicios", requireAuth, async (req, res) => {
   try {
-    const { slug, nombre, descripcion, duracion, precio, capacidad, orden } = req.body;
-    const cleanSlug = getCleanSlug(slug || req.auth.slug);
+    const { dominio, nombre, descripcion, duracion, precio, capacidad, orden } = req.body;
+    const dominioClean = cleanDominio(dominio || req.auth.dominio);
 
-    if (!cleanSlug || !nombre || !duracion || precio === undefined) {
+    if (!dominioClean || !nombre || !duracion || precio === undefined) {
       return res.status(400).json({ success: false, error: "Faltan campos: nombre, duracion, precio." });
     }
 
     const { data, error } = await supabase.from("servicios").insert([{
-      slug:        cleanSlug,
+      dominio:     dominioClean,
       nombre:      nombre.trim(),
       descripcion: descripcion?.trim() || "",
       duracion:    parseInt(duracion),
@@ -847,7 +904,7 @@ app.post("/admin/servicios", requireAuth, async (req, res) => {
     }]).select().single();
 
     if (error) throw error;
-    invalidateCache(cleanSlug);
+    invalidateCache(dominioClean);
     res.status(201).json({ success: true, servicio: data });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -857,8 +914,8 @@ app.post("/admin/servicios", requireAuth, async (req, res) => {
 /** PUT /admin/servicios/:id — editar */
 app.put("/admin/servicios/:id", requireAuth, async (req, res) => {
   try {
-    const { id }     = req.params;
-    const cleanSlug  = getCleanSlug(req.body.slug || req.auth.slug);
+    const { id }        = req.params;
+    const dominioClean  = cleanDominio(req.body.dominio || req.auth.dominio);
     const { nombre, descripcion, duracion, precio, capacidad, activo, orden } = req.body;
 
     const u = {};
@@ -871,10 +928,10 @@ app.put("/admin/servicios/:id", requireAuth, async (req, res) => {
     if (orden       !== undefined) u.orden       = parseInt(orden);
 
     const { data, error } = await supabase
-      .from("servicios").update(u).eq("id", id).eq("slug", cleanSlug).select().single();
+      .from("servicios").update(u).eq("id", id).eq("dominio", dominioClean).select().single();
 
     if (error) throw error;
-    invalidateCache(cleanSlug);
+    invalidateCache(dominioClean);
     res.json({ success: true, servicio: data });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -884,127 +941,26 @@ app.put("/admin/servicios/:id", requireAuth, async (req, res) => {
 /** DELETE /admin/servicios/:id — eliminar */
 app.delete("/admin/servicios/:id", requireAuth, async (req, res) => {
   try {
-    const { id }    = req.params;
-    const cleanSlug = getCleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
+    const { id }       = req.params;
+    const dominioClean = cleanDominio(req.body?.dominio || req.query?.dominio || req.auth.dominio);
 
-    const { error } = await supabase.from("servicios").delete().eq("id", id).eq("slug", cleanSlug);
+    const { error } = await supabase.from("servicios").delete().eq("id", id).eq("dominio", dominioClean);
     if (error) throw error;
-    invalidateCache(cleanSlug);
+    invalidateCache(dominioClean);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-// ─── Aliases de compatibilidad con v5 ────────────────────────
-// Estas rutas siguen funcionando para no romper componentes Framer existentes
-
-app.post("/servicios/crear", requireAuth, async (req, res) => {
-  try {
-    const { slug, nombre, descripcion, duracion, precio, capacidad, orden } = req.body;
-    const cleanSlug = getCleanSlug(slug || req.auth.slug);
-    if (!cleanSlug || !nombre || !duracion || precio === undefined) {
-      return res.status(400).json({ success: false, error: "Faltan campos: nombre, duracion, precio." });
-    }
-    const { data, error } = await supabase.from("servicios").insert([{
-      slug: cleanSlug, nombre: nombre.trim(),
-      descripcion: descripcion?.trim() || "",
-      duracion: parseInt(duracion), precio: Number(precio),
-      capacidad: parseInt(capacidad) || 1, orden: parseInt(orden) || 0, activo: true,
-    }]).select().single();
-    if (error) throw error;
-    invalidateCache(cleanSlug);
-    res.status(201).json({ success: true, servicio: data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post("/servicios/editar", requireAuth, async (req, res) => {
-  try {
-    const { id, slug, nombre, descripcion, duracion, precio, capacidad, activo } = req.body;
-    const cleanSlug = getCleanSlug(slug || req.auth.slug);
-    if (!id) return res.status(400).json({ success: false, error: "Falta el id." });
-    const u = {};
-    if (nombre      !== undefined) u.nombre      = nombre.trim();
-    if (descripcion !== undefined) u.descripcion = descripcion.trim();
-    if (duracion    !== undefined) u.duracion    = parseInt(duracion);
-    if (precio      !== undefined) u.precio      = Number(precio);
-    if (capacidad   !== undefined) u.capacidad   = parseInt(capacidad);
-    if (activo      !== undefined) u.activo      = activo;
-    const { data, error } = await supabase.from("servicios").update(u).eq("id", id).eq("slug", cleanSlug).select().single();
-    if (error) throw error;
-    invalidateCache(cleanSlug);
-    res.json({ success: true, servicio: data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post("/servicios/eliminar", requireAuth, async (req, res) => {
-  try {
-    const { id, slug } = req.body;
-    const cleanSlug = getCleanSlug(slug || req.auth.slug);
-    if (!id) return res.status(400).json({ success: false, error: "Falta el id." });
-    const { error } = await supabase.from("servicios").delete().eq("id", id).eq("slug", cleanSlug);
-    if (error) throw error;
-    invalidateCache(cleanSlug);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Alias v5: /servicios/admin/:slug → /admin/servicios/:slug
-app.get("/servicios/admin/:slug", requireAuth, async (req, res) => {
-  try {
-    const slug = getCleanSlug(req.params.slug);
-    const { data, error } = await supabase.from("servicios").select("*").eq("slug", slug)
-      .order("orden", { ascending: true }).order("created_at", { ascending: true });
-    if (error) throw error;
-    res.json({ success: true, servicios: data || [] });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Alias v5: /get-occupied → /turnos/ocupados
-app.get("/get-occupied", async (req, res) => {
-  try {
-    const slug  = getCleanSlug(req.query.slug);
-    const fecha = req.query.fecha;
-    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
-    let q = supabase.from("turnos").select("hora").eq("slug", slug).neq("estado", "cancelado");
-    if (fecha) q = q.eq("fecha", fecha);
-    const { data, error } = await q;
-    if (error) throw error;
-    res.json({ success: true, ocupados: (data || []).map((t) => t.hora.slice(0, 5)) });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// Alias v5: /create-booking → /turnos/reservar
-app.post("/create-booking", limiterBooking, async (req, res) => {
-  // Normaliza el campo "name" que en v5 venía como "name"
-  req.body.name = req.body.name || req.body.nombre;
-  req.body.phone = req.body.phone || req.body.telefono;
-  // Re-enruta internamente (simple, sin app._router)
-  return res.redirect(307, "/turnos/reservar");
-});
-
 
 // ══════════════════════════════════════════════════════════════
-// AGENDA — Vista agrupada por fecha
+// AGENDA — Vista agrupada por fecha (próximos 30 días)
 // ══════════════════════════════════════════════════════════════
 
-/**
- * GET /agenda/:slug
- * Devuelve turnos agrupados por fecha (próximos 30 días).
- */
-app.get("/agenda/:slug", requireAuth, async (req, res) => {
+app.get("/agenda/:dominio", requireAuth, async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
+    const dominio = cleanDominio(req.params.dominio);
 
     const ahoraArg = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
     const hoyISO   = ahoraArg.toISOString().split("T")[0];
@@ -1014,9 +970,8 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
 
     const { data: turnos, error } = await supabase
       .from("turnos").select("*")
-      .eq("slug", slug)
-      .gte("fecha", hoyISO)
-      .lte("fecha", hastaISO)
+      .eq("dominio", dominio)
+      .gte("fecha", hoyISO).lte("fecha", hastaISO)
       .neq("estado", "cancelado")
       .order("fecha", { ascending: true })
       .order("hora",  { ascending: true });
@@ -1027,14 +982,15 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
     (turnos || []).forEach((t) => {
       if (!porFecha[t.fecha]) porFecha[t.fecha] = [];
       porFecha[t.fecha].push({
-        id:       t.id,
-        nombre:   t.nombre,
-        hora:     t.hora.slice(0, 5),
-        servicio: t.servicio_nombre || null,
-        estado:   t.estado,
-        email:    t.email,
-        telefono: t.telefono,
-        notas:    t.notas || null,
+        id:             t.id,
+        nombre:         t.nombre,
+        hora:           t.hora.slice(0, 5),
+        servicio:       t.servicio_nombre || null,
+        precio_cobrado: t.precio_cobrado  || 0,
+        estado:         t.estado,
+        email:          t.email,
+        telefono:       t.telefono,
+        notas:          t.notas || null,
       });
     });
 
@@ -1046,28 +1002,25 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
 
     res.json({ success: true, hoy: hoyISO, dias });
   } catch (e) {
-    console.error("Error en /agenda/:slug:", e.message);
+    console.error("Error en /agenda/:dominio:", e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
 
 // ══════════════════════════════════════════════════════════════
-// COBROS — Lista de ventas
+// COBROS — Lista de ventas del negocio
 // ══════════════════════════════════════════════════════════════
 
-/**
- * GET /cobros/:slug?limite=20&offset=0
- */
-app.get("/cobros/:slug", requireAuth, async (req, res) => {
+app.get("/cobros/:dominio", requireAuth, async (req, res) => {
   try {
-    const slug   = getCleanSlug(req.params.slug);
-    const limite = parseInt(req.query.limite) || 20;
-    const offset = parseInt(req.query.offset) || 0;
+    const dominio = cleanDominio(req.params.dominio);
+    const limite  = parseInt(req.query.limite) || 20;
+    const offset  = parseInt(req.query.offset) || 0;
 
     const { data: ventas, error, count } = await supabase
       .from("ventas").select("*", { count: "exact" })
-      .eq("slug", slug)
+      .eq("dominio", dominio)
       .order("fecha_pago", { ascending: false })
       .range(offset, offset + limite - 1);
 
@@ -1076,7 +1029,6 @@ app.get("/cobros/:slug", requireAuth, async (req, res) => {
     const cobros = (ventas || []).map((v) => ({
       id:               v.id,
       monto:            v.monto,
-      service_fee:      v.service_fee || 0,
       moneda:           v.moneda || "ARS",
       metodo_pago:      v.metodo_pago,
       estado:           v.estado,
@@ -1100,18 +1052,15 @@ app.get("/cobros/:slug", requireAuth, async (req, res) => {
 // CLIENTES — CRM básico
 // ══════════════════════════════════════════════════════════════
 
-/**
- * GET /clientes/:slug?limite=20&offset=0
- */
-app.get("/clientes/:slug", requireAuth, async (req, res) => {
+app.get("/clientes/:dominio", requireAuth, async (req, res) => {
   try {
-    const slug   = getCleanSlug(req.params.slug);
-    const limite = parseInt(req.query.limite) || 20;
-    const offset = parseInt(req.query.offset) || 0;
+    const dominio = cleanDominio(req.params.dominio);
+    const limite  = parseInt(req.query.limite) || 20;
+    const offset  = parseInt(req.query.offset) || 0;
 
     const { data: turnos, error } = await supabase
       .from("turnos").select("nombre, email, telefono, fecha, created_at")
-      .eq("slug", slug).neq("estado", "cancelado")
+      .eq("dominio", dominio).neq("estado", "cancelado")
       .order("created_at", { ascending: false });
 
     if (error) throw error;
@@ -1122,7 +1071,7 @@ app.get("/clientes/:slug", requireAuth, async (req, res) => {
       if (!clientesMap[key]) {
         clientesMap[key] = {
           nombre:      t.nombre,
-          email:       t.email   || null,
+          email:       t.email    || null,
           telefono:    t.telefono || null,
           turnos:      0,
           ultimoTurno: t.fecha,
@@ -1138,13 +1087,10 @@ app.get("/clientes/:slug", requireAuth, async (req, res) => {
       .map((c) => ({ ...c, frecuencia: calcularFrecuencia(c.turnos) }))
       .sort((a, b) => b.turnos - a.turnos);
 
-    const total    = clientesArr.length;
-    const clientes = clientesArr.slice(offset, offset + limite);
-
     res.json({
       success: true,
-      clientes,
-      total,
+      clientes: clientesArr.slice(offset, offset + limite),
+      total:    clientesArr.length,
       offset,
       limite,
       stats: {
@@ -1160,20 +1106,16 @@ app.get("/clientes/:slug", requireAuth, async (req, res) => {
 
 
 // ══════════════════════════════════════════════════════════════
-// SETTINGS — Configuración del negocio
+// SETTINGS — Configuración del negocio (panel del dueño)
 // ══════════════════════════════════════════════════════════════
 
-/**
- * GET /settings/:slug
- * Devuelve la configuración completa del negocio.
- */
-app.get("/settings/:slug", requireAuth, async (req, res) => {
+app.get("/settings/:dominio", requireAuth, async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
+    const dominio = cleanDominio(req.params.dominio);
     const { data: user, error } = await supabase
       .from("usuarios")
-      .select("slug, business_name, rubro, nombre_persona, last_name, email, telefono, precio, monto_sena, duracion_turno, capacidad_por_turno, metodo_pago, quien_asume_comision, horarios, excepciones, mp_access_token, mobbex_api_key, notas_internas")
-      .eq("slug", slug).single();
+      .select("dominio, business_name, rubro, nombre_persona, apellido, email, telefono, duracion_turno, capacidad_por_turno, metodo_pago, porcentaje_sena, quien_asume_comision, horarios, excepciones, mp_access_token, mobbex_api_key, notas_internas")
+      .eq("dominio", dominio).single();
 
     if (error || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
 
@@ -1181,9 +1123,8 @@ app.get("/settings/:slug", requireAuth, async (req, res) => {
       success: true,
       settings: {
         ...user,
-        mp_status:     user.mp_access_token ? "Conectado" : "Desconectado",
-        mobbex_status: user.mobbex_api_key  ? "Conectado" : "Desconectado",
-        // No devolver tokens reales
+        mp_status:           user.mp_access_token ? "Conectado" : "Desconectado",
+        mobbex_status:       user.mobbex_api_key  ? "Conectado" : "Desconectado",
         mp_access_token:     undefined,
         mobbex_api_key:      undefined,
         mobbex_access_token: undefined,
@@ -1194,71 +1135,59 @@ app.get("/settings/:slug", requireAuth, async (req, res) => {
   }
 });
 
-/**
- * POST /settings/:slug  (o PUT — ambos funcionan)
- * Actualiza configuración del negocio.
- */
 const handleUpdateSettings = async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug || req.body.slug);
+    const dominio = cleanDominio(req.params.dominio || req.body.dominio);
     const {
-      precio, horarios, duracion_turno, excepciones,
-      monto_sena, metodo_pago, quien_asume_comision,
+      horarios, duracion_turno, excepciones,
+      porcentaje_sena, metodo_pago, quien_asume_comision,
       capacidad_por_turno, business_name, telefono, rubro,
     } = req.body;
 
-    const numPrecio = parseInt(precio);
-    const numSena   = parseInt(monto_sena);
-    if (!isNaN(numPrecio) && numPrecio < 0) return res.status(400).json({ success: false, error: "El precio no puede ser negativo." });
-
     const u = {};
-    if (!isNaN(numPrecio))         u.precio              = numPrecio;
-    if (!isNaN(numSena))           u.monto_sena          = numSena;
     if (metodo_pago)               u.metodo_pago         = metodo_pago;
+    if (porcentaje_sena !== undefined && !isNaN(parseInt(porcentaje_sena))) {
+      u.porcentaje_sena = Math.min(100, Math.max(1, parseInt(porcentaje_sena)));
+    }
     if (duracion_turno)            u.duracion_turno      = parseInt(duracion_turno);
     if (capacidad_por_turno)       u.capacidad_por_turno = parseInt(capacidad_por_turno);
     if (quien_asume_comision)      u.quien_asume_comision= quien_asume_comision;
     if (horarios)                  u.horarios            = horarios;
-    if (excepciones)               u.excepciones         = excepciones;
+    if (excepciones !== undefined) u.excepciones         = excepciones;
     if (business_name)             u.business_name       = business_name.trim();
     if (telefono)                  u.telefono            = telefono.trim();
     if (rubro)                     u.rubro               = rubro;
 
-    const { error } = await supabase.from("usuarios").update(u).eq("slug", slug);
+    const { error } = await supabase.from("usuarios").update(u).eq("dominio", dominio);
     if (error) throw error;
-    invalidateCache(slug);
+    invalidateCache(dominio);
     res.json({ success: true, message: "Configuración actualizada." });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 };
 
-app.post("/settings/:slug",        requireAuth, handleUpdateSettings);
-app.put("/settings/:slug",         requireAuth, handleUpdateSettings);
-// Alias de compatibilidad v5
-app.post("/update-settings",       requireAuth, handleUpdateSettings);
+app.post("/settings/:dominio", requireAuth, handleUpdateSettings);
+app.put("/settings/:dominio",  requireAuth, handleUpdateSettings);
 
 
 // ══════════════════════════════════════════════════════════════
-// ADMIN STATS — Dashboard principal
+// ADMIN STATS — Dashboard principal del dueño
 // ══════════════════════════════════════════════════════════════
 
-/**
- * GET /admin-stats/:slug
- * Stats completas para el panel del dueño.
- */
-app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
+app.get("/admin-stats/:dominio", requireAuth, async (req, res) => {
   try {
-    const slug = getCleanSlug(req.params.slug);
-    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+    const dominio = cleanDominio(req.params.dominio);
+    if (!dominio) return res.status(400).json({ success: false, error: "Dominio inválido." });
 
     // Caché de 20 segundos
     const now = Date.now();
-    if (globalCache[slug] && now - globalCache[slug].timestamp < CACHE_DURATION) {
-      return res.json(globalCache[slug].data);
+    if (globalCache[dominio] && now - globalCache[dominio].timestamp < CACHE_DURATION) {
+      return res.json(globalCache[dominio].data);
     }
 
-    const { data: user, error: userError } = await supabase.from("usuarios").select("*").eq("slug", slug).single();
+    const { data: user, error: userError } = await supabase
+      .from("usuarios").select("*").eq("dominio", dominio).single();
     if (userError || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
 
     const ahoraArg   = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
@@ -1268,17 +1197,17 @@ app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
     const hoyISO     = `${anioActual}-${String(mesActual).padStart(2, "0")}-${String(diaHoyNum).padStart(2, "0")}`;
     const inicioMes  = `${anioActual}-${String(mesActual).padStart(2, "0")}-01`;
 
-    // Turnos del mes (no cancelados)
+    // Turnos del mes
     const { data: turnosMes } = await supabase
       .from("turnos").select("*")
-      .eq("slug", slug).gte("fecha", inicioMes).neq("estado", "cancelado")
+      .eq("dominio", dominio).gte("fecha", inicioMes).neq("estado", "cancelado")
       .order("fecha", { ascending: true }).order("hora", { ascending: true });
 
     const turnosData     = turnosMes || [];
     const turnosHoy      = turnosData.filter((t) => t.fecha === hoyISO).length;
     const turnosMesTotal = turnosData.length;
 
-    // Chart semanal (distribución del mes en semanas)
+    // Chart semanal
     const semanas = { "Sem 1": 0, "Sem 2": 0, "Sem 3": 0, "Sem 4": 0 };
     turnosData.forEach((t) => {
       const dia = parseInt(t.fecha.split("-")[2]);
@@ -1288,37 +1217,36 @@ app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
       else                semanas["Sem 4"]++;
     });
 
-    // Lista completa de turnos del mes
     const turnosLista = turnosData.map((t) => ({
-      id:       t.id,
-      nombre:   t.nombre,
-      telefono: t.telefono,
-      email:    t.email,
-      fecha:    t.fecha,
-      hora:     t.hora.slice(0, 5),
-      servicio: t.servicio_nombre,
-      estado:   t.estado,
-      notas:    t.notas || null,
-      duracion: user.duracion_turno || 60,
+      id:             t.id,
+      nombre:         t.nombre,
+      telefono:       t.telefono,
+      email:          t.email,
+      fecha:          t.fecha,
+      hora:           t.hora.slice(0, 5),
+      servicio:       t.servicio_nombre,
+      precio_cobrado: t.precio_cobrado || 0,
+      estado:         t.estado,
+      notas:          t.notas || null,
+      duracion:       user.duracion_turno || 30,
     })).reverse();
 
-    // Detalle de turnos de hoy (para el widget de inicio)
     const turnosHoyDetalle = turnosData
       .filter((t) => t.fecha === hoyISO)
       .sort((a, b) => a.hora.localeCompare(b.hora))
       .map((t) => ({
-        id:       t.id,
-        nombre:   t.nombre,
-        hora:     t.hora.slice(0, 5),
+        id:      t.id,
+        nombre:  t.nombre,
+        hora:    t.hora.slice(0, 5),
         servicio: t.servicio_nombre,
-        estado:   t.estado,
+        estado:  t.estado,
       }));
 
-    // Ventas (últimos 90 días + próximos 7)
+    // Ventas (últimos 90 días)
     const desde90 = new Date(ahoraArg); desde90.setDate(desde90.getDate() - 90);
     const hasta7  = new Date(ahoraArg); hasta7.setDate(hasta7.getDate() + 7);
     const { data: ventasData } = await supabase
-      .from("ventas").select("*").eq("slug", slug)
+      .from("ventas").select("*").eq("dominio", dominio)
       .gte("fecha_turno", desde90.toISOString().split("T")[0])
       .lte("fecha_turno", hasta7.toISOString().split("T")[0])
       .order("fecha_pago", { ascending: true });
@@ -1333,14 +1261,14 @@ app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
       ...(metricas.porDia[fecha] || { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 }),
     }));
 
-    // Clientes únicos totales (por teléfono)
+    // Clientes únicos totales
     const { data: todosLosTurnos } = await supabase
       .from("turnos").select("telefono, email, created_at")
-      .eq("slug", slug).neq("estado", "cancelado");
+      .eq("dominio", dominio).neq("estado", "cancelado");
 
-    const clientesUnicos    = new Set();
-    const clientesMesSet    = new Set();
-    const inicioMesDate     = new Date(inicioMes + "T00:00:00");
+    const clientesUnicos = new Set();
+    const clientesMesSet = new Set();
+    const inicioMesDate  = new Date(inicioMes + "T00:00:00");
 
     (todosLosTurnos || []).forEach((t) => {
       const key = t.telefono || t.email?.toLowerCase();
@@ -1350,66 +1278,63 @@ app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
       }
     });
 
+    // Ventajas por día del mes hasta hoy
+    const ventasPorDia = {};
+    generarRangoDias(inicioMes, diaHoyNum).forEach((d) => {
+      ventasPorDia[d] = metricas.porDia[d] || { volumen: 0, cantidad: 0, aprobado: 0, pendiente: 0, rechazado: 0 };
+    });
+
     const finalData = {
-      stats: {
-        nombre_persona:  user.nombre_persona,
-        last_name:       user.last_name || "",
-        businessName:    user.business_name,
-        rubro:           user.rubro || "generico",
-        slug:            user.slug,
-        agenda_url:      `${API_URL}/agenda?u=${user.slug}`,
+      turnosHoy,
+      turnosMes:       turnosMesTotal,
+      turnosHoyDetalle,
+      chartData:       Object.keys(semanas).map((k) => ({ label: k, turnos: semanas[k] })),
+      turnosLista,
 
-        // Turnos
-        turnosHoy,
-        turnosMes:       turnosMesTotal,
-        turnosHoyDetalle,
-        chartData:       Object.keys(semanas).map((k) => ({ label: k, turnos: semanas[k] })),
-        turnosLista,
+      totalClientes:        clientesUnicos.size,
+      clientesNuevos:       clientesMesSet.size,
+      clientesConcurrentes: Math.floor(clientesUnicos.size * 0.4),
 
-        // Clientes
-        totalClientes:        clientesUnicos.size,
-        clientesNuevos:       clientesMesSet.size,
-        clientesConcurrentes: Math.floor(clientesUnicos.size * 0.4),
-
-        // Ventas
-        ventas: {
-          volumenTotal:   metricas.volumenTotal,
-          volumenNeto:    metricas.volumenNeto,
-          volumenHoy:     ventasHoy.volumen,
-          volumenMes:     ventasMes.volumen  || 0,
-          ticketPromedio: metricas.ticketPromedio,
-          cantidadTotal:  metricas.cantidadTotal,
-          cantidadHoy:    ventasHoy.cantidad,
-          cantidadMes:    ventasMes.cantidad || 0,
-          feeTotal:       metricas.feeTotal,
-          estados: {
-            aprobado:  metricas.porEstado.aprobado  || 0,
-            pendiente: metricas.porEstado.pendiente || 0,
-            rechazado: metricas.porEstado.rechazado || 0,
-          },
-        },
-
-        ventasPorDia:  metricas.porDia,
-        ventasPorSem:  metricas.porSemana,
-        ventasPorMes:  metricas.porMes,
-        proximosDias,
-
-        horarios: user.horarios,
-        config: {
-          duracion:             user.duracion_turno,
-          capacidad_por_turno:  user.capacidad_por_turno || 1,
-          precio:               user.precio,
-          monto_sena:           user.monto_sena || 0,
-          metodo_pago:          user.metodo_pago || "none",
-          quien_asume_comision: user.quien_asume_comision || "cliente",
-          mp_status:            user.mp_access_token ? "Conectado" : "Desconectado",
-          mobbex_status:        user.mobbex_api_key  ? "Conectado" : "Desconectado",
-          excepciones:          user.excepciones || [],
+      ventas: {
+        volumenTotal:   metricas.volumenTotal,
+        volumenHoy:     ventasHoy.volumen,
+        volumenMes:     ventasMes.volumen  || 0,
+        ticketPromedio: metricas.ticketPromedio,
+        cantidadTotal:  metricas.cantidadTotal,
+        cantidadHoy:    ventasHoy.cantidad,
+        cantidadMes:    ventasMes.cantidad || 0,
+        estados: {
+          aprobado:  metricas.porEstado.aprobado  || 0,
+          pendiente: metricas.porEstado.pendiente || 0,
+          rechazado: metricas.porEstado.rechazado || 0,
         },
       },
+
+      ventasPorDia,
+      ventasPorSem:  metricas.porSemana,
+      ventasPorMes:  metricas.porMes,
+      proximosDias,
+
+      horarios:      user.horarios,
+      config: {
+        duracion:             user.duracion_turno      || 30,
+        capacidad_por_turno:  user.capacidad_por_turno || 1,
+        metodo_pago:          user.metodo_pago         || "none",
+        porcentaje_sena:      user.porcentaje_sena     || 30,
+        quien_asume_comision: user.quien_asume_comision|| "cliente",
+        mp_status:            user.mp_access_token ? "Conectado" : "Desconectado",
+        mobbex_status:        user.mobbex_api_key  ? "Conectado" : "Desconectado",
+        excepciones:          user.excepciones     || [],
+      },
+
+      businessName:   user.business_name,
+      nombre_persona: user.nombre_persona,
+      apellido:       user.apellido || "",
+      dominio:        user.dominio,
+      rubro:          user.rubro || "generico",
     };
 
-    globalCache[slug] = { timestamp: now, data: finalData };
+    globalCache[dominio] = { timestamp: now, data: finalData };
     res.json(finalData);
   } catch (e) {
     console.error("Error en /admin-stats:", e.message);
@@ -1420,51 +1345,64 @@ app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // PAGOS — Mercado Pago + Mobbex
+// El precio siempre viene del servicio seleccionado.
+// No hay comisión de plataforma (service_fee = 0 siempre).
 // ══════════════════════════════════════════════════════════════
 
-/**
- * POST /api/create-preference
- * Crea una preferencia de pago (MP o Mobbex).
- */
 app.post("/api/create-preference", limiterBooking, async (req, res) => {
   try {
-    const { nombre, telefono, email, fecha, hora, slug, servicio_id } = req.body;
+    const { nombre, telefono, email, fecha, hora, dominio, servicio_id } = req.body;
 
-    if (!nombre || !telefono || !fecha || !hora || !slug) {
+    if (!nombre || !telefono || !fecha || !hora || !dominio) {
       return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
     }
-    if (email && !validateEmail(email)) return res.status(400).json({ success: false, error: "Email inválido." });
+    if (email && !validateEmail(email)) {
+      return res.status(400).json({ success: false, error: "Email inválido." });
+    }
 
-    const cleanSlug = getCleanSlug(slug);
-    const { data: user, error: userError } = await supabase.from("usuarios").select("*").eq("slug", cleanSlug).single();
+    const dominioClean = cleanDominio(dominio);
+    const { data: user, error: userError } = await supabase
+      .from("usuarios").select("*").eq("dominio", dominioClean).single();
     if (userError || !user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
 
-    let precioTotalServicio = Number(user.precio || 0);
-    let nombreServicio      = "Reserva";
+    // Precio: obligatoriamente del servicio
+    let precioServicio = 0;
+    let nombreServicio = "Reserva";
 
     if (servicio_id) {
-      const { data: srv } = await supabase.from("servicios").select("*").eq("id", servicio_id).eq("slug", cleanSlug).single();
+      const { data: srv } = await supabase
+        .from("servicios").select("nombre, precio")
+        .eq("id", servicio_id).eq("dominio", dominioClean).single();
       if (srv) {
-        precioTotalServicio = Number(srv.precio || precioTotalServicio);
-        nombreServicio      = srv.nombre;
+        precioServicio = Number(srv.precio || 0);
+        nombreServicio = srv.nombre;
       }
     }
 
     const metodo    = user.metodo_pago || "none";
     const debePagar = metodo === "sena" || metodo === "total";
-    if (!debePagar || precioTotalServicio <= 0) return res.json({ isFree: true });
+    if (!debePagar || precioServicio <= 0) return res.json({ isFree: true });
 
-    const montoServicio = metodo === "sena" && user.monto_sena ? Number(user.monto_sena) : precioTotalServicio;
-    const quienAsume    = user.quien_asume_comision || "cliente";
-    const serviceFee    = calcularServiceFee(precioTotalServicio);
-    const totalCobrado  = quienAsume === "cliente" ? montoServicio + serviceFee : montoServicio;
-    const conceptoPago  = metodo === "sena" ? "Seña" : "Total";
+    // Seña: porcentaje del precio del servicio
+    const montoACobrar = metodo === "sena"
+      ? Math.round(precioServicio * (user.porcentaje_sena || 30) / 100)
+      : precioServicio;
+
+    const conceptoPago = metodo === "sena"
+      ? `Seña ${user.porcentaje_sena || 30}%`
+      : "Total";
 
     const metaMeta = {
-      nombre, telefono: cleanPhone(telefono), email: email || "",
-      fecha, hora, slug: cleanSlug,
-      servicio_id: servicio_id || "", servicio_nombre: nombreServicio,
-      metodo_pago: metodo, precio_servicio: precioTotalServicio, service_fee: serviceFee,
+      nombre,
+      telefono:        cleanPhone(telefono),
+      email:           email || "",
+      fecha,
+      hora,
+      dominio:         dominioClean,
+      servicio_id:     servicio_id || "",
+      servicio_nombre: nombreServicio,
+      metodo_pago:     metodo,
+      precio_servicio: precioServicio,
     };
 
     const successUrl = process.env.SUCCESS_URL || `${API_URL}/success`;
@@ -1473,26 +1411,33 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
     // MOBBEX (prioridad)
     if (user.mobbex_api_key && user.mobbex_access_token) {
       try {
-        const items = [{ image: "", description: `${nombreServicio} (${conceptoPago})`, quantity: 1, price: montoServicio }];
-        if (quienAsume === "cliente") items.push({ image: "", description: "Gasto de Gestión Online", quantity: 1, price: serviceFee });
-
         const mobbexRes = await fetch("https://api.mobbex.com/p/sessions", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "x-api-key": user.mobbex_api_key, "x-access-token": user.mobbex_access_token },
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key":      user.mobbex_api_key,
+            "x-access-token": user.mobbex_access_token,
+          },
           body: JSON.stringify({
-            total: totalCobrado, currency: "ARS",
+            total:       montoACobrar,
+            currency:    "ARS",
             description: `${nombreServicio} (${conceptoPago}): ${fecha} ${hora}hs`,
-            reference: `${cleanSlug}-${fecha}-${hora}`.replace(/:/g, ""),
-            webhook: `${API_URL}/webhook/mobbex`, return_url: successUrl,
-            items,
-            split: [{ tax_id: process.env.MOBBEX_PLATFORM_CUIT, total: serviceFee, fee: 0 }],
+            reference:   `${dominioClean}-${fecha}-${hora}`.replace(/[:.]/g, ""),
+            webhook:     `${API_URL}/webhook/mobbex`,
+            return_url:  successUrl,
+            items: [{
+              image:       "",
+              description: `${nombreServicio} (${conceptoPago})`,
+              quantity:    1,
+              price:       montoACobrar,
+            }],
             metadata: metaMeta,
-            options: { button: false, redirect: true },
+            options:  { button: false, redirect: true },
           }),
         });
         const mobbexData = await mobbexRes.json();
         if (mobbexData?.data?.url) {
-          return res.json({ payment_url: mobbexData.data.url, service_fee: serviceFee, total_cobrado: totalCobrado, pasarela: "mobbex" });
+          return res.json({ payment_url: mobbexData.data.url, monto: montoACobrar, pasarela: "mobbex" });
         }
         console.warn("⚠️ Mobbex sin URL, fallback a MP:", mobbexData);
       } catch (e) {
@@ -1506,26 +1451,28 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
         const client = new MercadoPagoConfig({ accessToken: user.mp_access_token });
         const pref   = new Preference(client);
 
-        const items = [{ title: `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`, unit_price: montoServicio, quantity: 1, currency_id: "ARS" }];
-        if (quienAsume === "cliente") items.push({ title: "Gasto de Gestión Online", unit_price: serviceFee, quantity: 1, currency_id: "ARS" });
-
         const response = await pref.create({
           body: {
-            items,
-            metadata: { ...metaMeta, tipo_pago: metodo },
+            items: [{
+              title:      `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`,
+              unit_price: montoACobrar,
+              quantity:   1,
+              currency_id: "ARS",
+            }],
+            metadata:         { ...metaMeta, tipo_pago: metodo },
             notification_url: `${API_URL}/webhook/mp`,
             back_urls: { success: successUrl, failure: cancelUrl, pending: cancelUrl },
             auto_return: "approved",
           },
         });
 
-        return res.json({ payment_url: response.init_point, service_fee: serviceFee, total_cobrado: totalCobrado, pasarela: "mercadopago" });
+        return res.json({ payment_url: response.init_point, monto: montoACobrar, pasarela: "mercadopago" });
       } catch (e) {
         return res.status(500).json({ success: false, error: "Error con MercadoPago." });
       }
     }
 
-    res.status(400).json({ success: false, error: "Sin método de pago configurado." });
+    res.status(400).json({ success: false, error: "Sin pasarela de pago configurada." });
   } catch (e) {
     console.error("Error en /api/create-preference:", e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -1536,30 +1483,32 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // OAUTH — Mercado Pago
 // ══════════════════════════════════════════════════════════════
+
 app.get("/oauth-callback", async (req, res) => {
-  const { code, state: slug } = req.query;
-  if (!code || !slug) return res.status(400).send("Parámetros inválidos.");
+  const { code, state: dominio } = req.query;
+  if (!code || !dominio) return res.status(400).send("Parámetros inválidos.");
 
   try {
-    const cleanSlug = getCleanSlug(slug);
-    const response  = await fetch("https://api.mercadopago.com/oauth/token", {
+    const dominioClean = cleanDominio(dominio);
+    const response = await fetch("https://api.mercadopago.com/oauth/token", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        client_id: process.env.MP_TURNERO_CLIENT_ID,
+        client_id:     process.env.MP_TURNERO_CLIENT_ID,
         client_secret: process.env.MP_TURNERO_CLIENT_SECRET,
-        grant_type: "authorization_code", code,
-        redirect_uri: `${API_URL}/oauth-callback`,
+        grant_type:    "authorization_code",
+        code,
+        redirect_uri:  `${API_URL}/oauth-callback`,
       }),
     });
-    const data = await response.json();
+    const data     = await response.json();
     const panelUrl = process.env.PANEL_URL || "https://negosocio.framer.website/panel";
 
     if (data.access_token) {
-      await supabase.from("usuarios").update({ mp_access_token: data.access_token }).eq("slug", cleanSlug);
-      invalidateCache(cleanSlug);
-      return res.redirect(`${panelUrl}?status=mp_success&u=${cleanSlug}`);
+      await supabase.from("usuarios").update({ mp_access_token: data.access_token }).eq("dominio", dominioClean);
+      invalidateCache(dominioClean);
+      return res.redirect(`${panelUrl}?status=mp_success&u=${dominioClean}`);
     }
-    res.redirect(`${panelUrl}?status=mp_error&u=${cleanSlug}`);
+    res.redirect(`${panelUrl}?status=mp_error&u=${dominioClean}`);
   } catch (e) {
     res.status(500).send("Error al vincular Mercado Pago.");
   }
@@ -1569,18 +1518,23 @@ app.get("/oauth-callback", async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // WEBHOOKS
 // ══════════════════════════════════════════════════════════════
-async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, hora, servicio_id, servicio_nombre, monto, moneda, service_fee, metodo_pago, payment_id, estado }) {
+
+async function procesarPagoConfirmado({ dominio, nombre, telefono, email, fecha, hora, servicio_id, servicio_nombre, monto, moneda, metodo_pago, payment_id, estado }) {
   let turnoId = null;
 
   if (estado === "aprobado") {
+    let precioCobrado = monto;
+
     const { data: turnoInsertado } = await supabase.from("turnos").insert([{
-      slug,
+      dominio,
       nombre:          nombre?.trim() || "Cliente",
       telefono:        cleanPhone(telefono?.toString() || "0"),
       email:           email?.trim().toLowerCase() || null,
-      fecha, hora,
+      fecha,
+      hora,
       servicio_id:     servicio_id || null,
       servicio_nombre: servicio_nombre || null,
+      precio_cobrado:  precioCobrado,
       estado:          "confirmado",
       metodo_pago,
       payment_id:      String(payment_id),
@@ -1588,7 +1542,7 @@ async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, ho
 
     turnoId = turnoInsertado?.id || null;
 
-    const { data: userNegocio } = await supabase.from("usuarios").select("email").eq("slug", slug).single();
+    const { data: userNegocio } = await supabase.from("usuarios").select("email").eq("dominio", dominio).single();
     if (userNegocio?.email) {
       fetch(APPS_SCRIPT_URL, {
         method: "POST", headers: { "Content-Type": "text/plain" },
@@ -1604,21 +1558,23 @@ async function procesarPagoConfirmado({ slug, nombre, telefono, email, fecha, ho
   }
 
   await supabase.from("ventas").insert([{
-    slug, turno_id: turnoId, fecha_turno: fecha,
+    dominio,
+    turno_id:         turnoId,
+    fecha_turno:      fecha,
     fecha_pago:       new Date().toISOString(),
-    monto, service_fee: service_fee || 0,
+    monto,
     moneda:           moneda || "ARS",
-    metodo_pago, estado,
+    metodo_pago,
+    estado,
     nombre_cliente:   nombre?.trim() || "Cliente",
-    email_cliente:    email?.trim() || null,
+    email_cliente:    email?.trim()  || null,
     telefono_cliente: cleanPhone(telefono?.toString() || ""),
-    servicio_id:      servicio_id || null,
+    servicio_id:      servicio_id    || null,
     servicio_nombre:  servicio_nombre || null,
     payment_id:       String(payment_id),
   }]);
 
-  invalidateCache(slug);
-  console.log(`✅ Webhook: ${slug} — ${estado} — $${monto} ARS | fee: $${service_fee}`);
+  invalidateCache(dominio);
 }
 
 app.post("/webhook/mp", async (req, res) => {
@@ -1632,11 +1588,10 @@ app.post("/webhook/mp", async (req, res) => {
         headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
       });
       const payData = await payRes.json();
+      const dominio = cleanDominio(payData.metadata?.dominio || payData.metadata?.slug || "");
+      if (!dominio) return res.sendStatus(200);
 
-      const slug = getCleanSlug(payData.metadata?.slug || "");
-      if (!slug) return res.sendStatus(200);
-
-      const { data: userNegocio } = await supabase.from("usuarios").select("mp_access_token").eq("slug", slug).single();
+      const { data: userNegocio } = await supabase.from("usuarios").select("mp_access_token").eq("dominio", dominio).single();
       let meta = payData.metadata;
       if (userNegocio?.mp_access_token) {
         const real = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
@@ -1647,12 +1602,19 @@ app.post("/webhook/mp", async (req, res) => {
 
       const estado = payData.status === "approved" ? "aprobado" : payData.status === "pending" ? "pendiente" : "rechazado";
       await procesarPagoConfirmado({
-        slug, nombre: meta.nombre, telefono: meta.telefono, email: meta.email,
-        fecha: meta.fecha, hora: meta.hora,
-        servicio_id: meta.servicio_id || null, servicio_nombre: meta.servicio_nombre || null,
-        monto: Number(payData.transaction_amount || 0), moneda: payData.currency_id || "ARS",
-        service_fee: Number(meta.service_fee || 0),
-        metodo_pago: "mercadopago", payment_id: paymentId, estado,
+        dominio,
+        nombre:          meta.nombre,
+        telefono:        meta.telefono,
+        email:           meta.email,
+        fecha:           meta.fecha,
+        hora:            meta.hora,
+        servicio_id:     meta.servicio_id    || null,
+        servicio_nombre: meta.servicio_nombre || null,
+        monto:           Number(payData.transaction_amount || 0),
+        moneda:          payData.currency_id || "ARS",
+        metodo_pago:     "mercadopago",
+        payment_id:      paymentId,
+        estado,
       });
     }
     res.sendStatus(200);
@@ -1668,19 +1630,26 @@ app.post("/webhook/mobbex", async (req, res) => {
     const statusCode = Number(body.status?.code || 0);
     const estado     = statusCode === 200 ? "aprobado" : statusCode >= 300 && statusCode < 400 ? "pendiente" : "rechazado";
     const meta       = body.metadata || {};
-    const slug       = getCleanSlug(meta.slug || "");
+    const dominio    = cleanDominio(meta.dominio || meta.slug || "");
     const monto      = Number(body.total || 0);
     const paymentId  = body.id || body.payment?.id || "mobbex-" + Date.now();
 
-    if (!slug) return res.sendStatus(200);
+    if (!dominio) return res.sendStatus(200);
 
     await procesarPagoConfirmado({
-      slug, nombre: meta.nombre, telefono: meta.telefono, email: meta.email,
-      fecha: meta.fecha, hora: meta.hora,
-      servicio_id: meta.servicio_id || null, servicio_nombre: meta.servicio_nombre || null,
-      monto, moneda: "ARS",
-      service_fee: Number(meta.service_fee || 0),
-      metodo_pago: "mobbex", payment_id: paymentId, estado,
+      dominio,
+      nombre:          meta.nombre,
+      telefono:        meta.telefono,
+      email:           meta.email,
+      fecha:           meta.fecha,
+      hora:            meta.hora,
+      servicio_id:     meta.servicio_id    || null,
+      servicio_nombre: meta.servicio_nombre || null,
+      monto,
+      moneda:          "ARS",
+      metodo_pago:     "mobbex",
+      payment_id:      paymentId,
+      estado,
     });
 
     res.sendStatus(200);
@@ -1711,10 +1680,10 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`
   ╔═══════════════════════════════════════════════╗
-  ║   NegoSocio API v6.0 — Multi-negocio         ║
-  ║   Alta manual por superadmin                 ║
-  ║   JWT auth (${JWT_EXPIRY}) · Fee: ${(FEE_RATE * 100).toFixed(1)}%            ║
-  ║   Endpoints: turnos, agenda, cobros, stats   ║
+  ║   NegoSocio API v7.0                         ║
+  ║   Identificador: dominio web del cliente     ║
+  ║   Precio: por servicio                       ║
+  ║   Sin comisiones de plataforma               ║
   ║   Puerto: ${PORT}                              ║
   ╚═══════════════════════════════════════════════╝
   `);
