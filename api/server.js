@@ -129,17 +129,44 @@ const diasHastaVencer = (fechaISO) => {
 };
 
 // Determina si una fecha es día laboral (según horarios + excepciones). Devuelve la config del día o null.
-function obtenerConfigDia(horarios, excepciones, fecha) {
+function obtenerIntervalosDia(horarios, excepciones, fecha) {
   const excepcionesArr = excepciones || [];
-  const estaExceptuado = Array.isArray(excepcionesArr)
-    ? excepcionesArr.some((e) => typeof e === "string" ? e === fecha : e?.fecha === fecha && e?.type === "block")
-    : false;
-  if (estaExceptuado) return null;
+  const excDelDia = Array.isArray(excepcionesArr)
+    ? excepcionesArr.find((e) => (typeof e === "string" ? e === fecha : e?.fecha === fecha))
+    : null;
+  const excType = typeof excDelDia === "string" ? "block" : excDelDia?.type;
 
+  if (excType === "block") return null;
+
+  const toMin = (t) => { if (!t) return null; const [h, m] = t.split(":").map(Number); return h * 60 + m; };
+
+  // Excepción con intervalos propios para ESTA fecha puntual
+  if (excType === "custom") {
+    const intervalos = (excDelDia?.slots || [])
+      .map(([desde, hasta]) => [toMin(desde), toMin(hasta)])
+      .filter(([ini, fin]) => ini != null && fin != null && fin > ini);
+    return intervalos.length ? intervalos : null;
+  }
+
+  // Sin excepción: horario semanal recurrente de ese día
   const diasSemana = ["domingo", "lunes", "martes", "miercoles", "jueves", "viernes", "sabado"];
   const diaConfig = horarios?.[diasSemana[new Date(fecha + "T12:00:00").getDay()]];
   if (!diaConfig?.activo) return null;
-  return diaConfig;
+
+  const inicioJornada = toMin(diaConfig.jornada?.[0]);
+  const finJornada    = toMin(diaConfig.jornada?.[1]);
+  if (inicioJornada == null || finJornada == null || finJornada <= inicioJornada) return null;
+
+  const dIni = toMin(diaConfig.descanso?.[0]);
+  const dFin = toMin(diaConfig.descanso?.[1]);
+
+  if (dIni != null && dFin != null && dFin > dIni) {
+    const intervalos = [];
+    if (dIni > inicioJornada) intervalos.push([inicioJornada, dIni]);
+    if (finJornada > dFin)    intervalos.push([dFin, finJornada]);
+    return intervalos;
+  }
+  return [[inicioJornada, finJornada]];
 }
 
 // Notifica al primero en la lista de espera cuando se libera un cupo
@@ -1011,23 +1038,19 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
       if (srv) { duracionSolicitada = srv.duracion || duracionSolicitada; capacidad = srv.capacidad || capacidad; }
     }
 
-    const diaConfig = obtenerConfigDia(user.horarios, user.excepciones, fecha);
-    if (!diaConfig) return res.json({ success: true, slots: [], puede_anotarse_espera: false });
+const intervalosDia = obtenerIntervalosDia(user.horarios, user.excepciones, fecha);
+if (!intervalosDia) return res.json({ success: true, slots: [], puede_anotarse_espera: false });
 
-    const toMin   = (t) => { if (!t) return null; const [h, m] = t.split(":").map(Number); return h * 60 + m; };
-    const fromMin = (m) => `${Math.floor(m / 60).toString().padStart(2, "0")}:${(m % 60).toString().padStart(2, "0")}`;
+const fromMin = (m) => `${Math.floor(m / 60).toString().padStart(2, "0")}:${(m % 60).toString().padStart(2, "0")}`;
 
-    const inicioJornada = toMin(diaConfig.jornada[0]);
-    const finJornada    = toMin(diaConfig.jornada[1]);
-    const dIni          = toMin(diaConfig.descanso?.[0]);
-    const dFin          = toMin(diaConfig.descanso?.[1]);
-
-    const slotsGenerados = [];
-    let cursor = inicioJornada;
-    while (cursor + duracionSolicitada <= finJornada) {
-      if (!(dIni && dFin && cursor >= dIni && cursor < dFin)) slotsGenerados.push(cursor);
-      cursor += duracionSolicitada;
-    }
+const slotsGenerados = [];
+intervalosDia.forEach(([ini, fin]) => {
+  let cursor = ini;
+  while (cursor + duracionSolicitada <= fin) {
+    slotsGenerados.push(cursor);
+    cursor += duracionSolicitada;
+  }
+});
 
     const { data: turnosDia } = await supabase.from("turnos").select("hora, estado, servicio_id")
       .eq("slug", slug).eq("fecha", fecha).in("estado", ["confirmado", "pendiente"]);
@@ -1145,8 +1168,8 @@ app.post("/turnos/lista-espera", limiterBooking, async (req, res) => {
     const estaSuspendido = user.estado_suscripcion === "suspendido" || (diasRestantes !== null && diasRestantes <= 0);
     if (estaSuspendido) return res.status(403).json({ success: false, error: "Este servicio está pausado temporalmente." });
 
-    const diaConfig = obtenerConfigDia(user.horarios, user.excepciones, fecha);
-    if (!diaConfig) return res.status(400).json({ success: false, error: "Ese día no es un día laboral." });
+    const intervalosDia = obtenerIntervalosDia(user.horarios, user.excepciones, fecha);
+    if (!intervalosDia) return res.status(400).json({ success: false, error: "Ese día no es un día laboral." });
 
     const emailClean = email?.trim().toLowerCase() || null;
 
