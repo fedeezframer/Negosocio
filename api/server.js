@@ -1041,6 +1041,7 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
 const intervalosDia = obtenerIntervalosDia(user.horarios, user.excepciones, fecha);
 if (!intervalosDia) return res.json({ success: true, slots: [], puede_anotarse_espera: false });
 
+const toMin   = (t) => { if (!t) return null; const [h, m] = t.split(":").map(Number); return h * 60 + m; };
 const fromMin = (m) => `${Math.floor(m / 60).toString().padStart(2, "0")}:${(m % 60).toString().padStart(2, "0")}`;
 
 const slotsGenerados = [];
