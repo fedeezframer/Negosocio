@@ -98,6 +98,17 @@ const cleanSlug = (raw) => {
     .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 };
 
+async function crearNotificacion({ slug, tipo, titulo, mensaje, data = {} }) {
+  try {
+    const { error } = await supabase.from("notificaciones").insert([{
+      slug, tipo, titulo, mensaje, data,
+    }]);
+    if (error) console.error("Error creando notificación:", error.message);
+  } catch (e) {
+    console.error("Error creando notificación:", e.message);
+  }
+}
+
 const isActivo = (val) => val === "true" || val === true;
 
 async function generarSlugUnico(businessName) {
