@@ -98,17 +98,6 @@ const cleanSlug = (raw) => {
     .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 };
 
-async function crearNotificacion({ slug, tipo, titulo, mensaje, data = {} }) {
-  try {
-    const { error } = await supabase.from("notificaciones").insert([{
-      slug, tipo, titulo, mensaje, data,
-    }]);
-    if (error) console.error("Error creando notificación:", error.message);
-  } catch (e) {
-    console.error("Error creando notificación:", e.message);
-  }
-}
-
 const isActivo = (val) => val === "true" || val === true;
 
 async function generarSlugUnico(businessName) {
@@ -180,6 +169,74 @@ function obtenerIntervalosDia(horarios, excepciones, fecha) {
   return [[inicioJornada, finJornada]];
 }
 
+// ══════════════════════════════════════════════════════════════
+// HELPER: NOTIFICACIONES IN-APP (bandeja de entrada del panel)
+// Inserta una fila en `notificaciones`. Nunca bloquea el flujo
+// principal: si falla, solo se loguea.
+// ══════════════════════════════════════════════════════════════
+async function crearNotificacion({ slug, tipo, titulo, mensaje, data = {} }) {
+  try {
+    const { error } = await supabase.from("notificaciones").insert([{
+      slug, tipo, titulo, mensaje, data,
+    }]);
+    if (error) console.error("Error creando notificación:", error.message);
+  } catch (e) {
+    console.error("Error creando notificación:", e.message);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// HELPER: TIPS DE BUENAS PRÁCTICAS (bandeja de entrada)
+// Se dispara una sola vez por regla gracias al flag guardado en
+// `data.clave`. Llamalo después del registro y opcionalmente desde
+// un cron diario liviano para negocios ya existentes.
+// ══════════════════════════════════════════════════════════════
+async function generarTips(slug) {
+  try {
+    const [{ data: user }, { data: servicios }] = await Promise.all([
+      supabase.from("usuarios").select("mp_access_token, logo_url, created_at").eq("slug", slug).maybeSingle(),
+      supabase.from("servicios").select("id").eq("slug", slug).limit(1),
+    ]);
+    if (!user) return;
+
+    const yaExiste = async (clave) => {
+      const { data } = await supabase.from("notificaciones")
+        .select("id").eq("slug", slug).eq("tipo", "tip")
+        .contains("data", { clave }).maybeSingle();
+      return !!data;
+    };
+
+    if (!user.mp_access_token && !(await yaExiste("conectar_mp"))) {
+      await crearNotificacion({
+        slug, tipo: "tip",
+        titulo: "Te recomendamos conectar Mercado Pago",
+        mensaje: "Con un método de pago activo (seña o pago total) reducís el ausentismo: los clientes que pagan casi no faltan.",
+        data: { clave: "conectar_mp" },
+      });
+    }
+
+    if ((!servicios || servicios.length === 0) && !(await yaExiste("cargar_servicios"))) {
+      await crearNotificacion({
+        slug, tipo: "tip",
+        titulo: "Cargá tus servicios",
+        mensaje: "Definir servicios con precio y duración hace que la reserva sea más rápida y clara para tus clientes.",
+        data: { clave: "cargar_servicios" },
+      });
+    }
+
+    if (!user.logo_url && !(await yaExiste("subir_logo"))) {
+      await crearNotificacion({
+        slug, tipo: "tip",
+        titulo: "Sumá tu logo",
+        mensaje: "Un logo propio le da más confianza a tus clientes al momento de reservar.",
+        data: { clave: "subir_logo" },
+      });
+    }
+  } catch (e) {
+    console.error("Error generando tips:", e.message);
+  }
+}
+
 // Notifica al primero en la lista de espera cuando se libera un cupo
 async function notificarListaEspera(slug, fecha) {
   const { data: pendientes } = await supabase.from("lista_espera")
@@ -211,6 +268,14 @@ async function notificarListaEspera(slug, fecha) {
   }
 
   await supabase.from("lista_espera").update({ estado: "notificado" }).eq("id", entrada.id);
+
+  crearNotificacion({
+    slug,
+    tipo: "lista_espera",
+    titulo: "Se avisó un cupo liberado",
+    mensaje: `${entrada.nombre} fue notificado/a por ${entrada.canal_aviso} sobre un cupo libre el ${fecha}.`,
+    data: { fecha },
+  });
 }
 
 async function verificarPassword(passwordIngresado, passwordGuardado, userId) {
@@ -499,7 +564,7 @@ function enviarWhatsappTurno({ telefono, nombreCliente, businessName, fechaHora,
 // ══════════════════════════════════════════════════════════════
 // RUTAS BASE
 // ══════════════════════════════════════════════════════════════
-app.get("/",       (_, res) => res.json({ status: "online", version: "13.6", timestamp: new Date().toISOString() }));
+app.get("/",       (_, res) => res.json({ status: "online", version: "13.7", timestamp: new Date().toISOString() }));
 app.get("/health", (_, res) => res.json({ status: "ok",     timestamp: new Date().toISOString() }));
 
 // ══════════════════════════════════════════════════════════════
@@ -645,6 +710,16 @@ app.post("/registro/verificar", limiterAuth, async (req, res) => {
         dias_prueba: planFinal === "premium" ? DIAS_PRUEBA : 0,
       }),
     }).catch((e) => console.error("Error mail bienvenida:", e.message));
+
+    // Notificación de bienvenida en la bandeja + tips iniciales
+    crearNotificacion({
+      slug: nuevo.slug,
+      tipo: "sistema",
+      titulo: "¡Bienvenido a Turnits!",
+      mensaje: "Tu cuenta está lista. Configurá tus servicios y horarios para empezar a recibir turnos.",
+      data: { clave: "bienvenida" },
+    });
+    generarTips(nuevo.slug);
 
     const secret = process.env.JWT_SECRET;
     const token  = secret
@@ -1414,6 +1489,15 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       servicio:      servicioNombre || "",
     });
 
+    // Notificación in-app para el dueño del negocio
+    crearNotificacion({
+      slug: slugClean,
+      tipo: "turno_nuevo",
+      titulo: "Nuevo turno reservado",
+      mensaje: `${name.trim()} reservó ${servicioNombre ? servicioNombre + " " : ""}para el ${fecha} a las ${hora}hs.`,
+      data: { turno_id: turno.id, fecha, hora },
+    });
+
     invalidateCache(slugClean);
 
     const comprobanteUrl = `${SUCCESS_URL}?slug=${slugClean}&turno_id=${turno.id}`;
@@ -1485,7 +1569,7 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
     }
 
     const { data: turnoExistente, error: fetchError } = await supabase
-      .from("turnos").select("id, slug, estado, fecha")
+      .from("turnos").select("id, slug, estado, fecha, hora, nombre")
       .eq("id", id).eq("slug", slugClean).maybeSingle();
 
     if (fetchError) throw fetchError;
@@ -1505,11 +1589,80 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
       notificarListaEspera(slugClean, turnoExistente.fecha).catch((e) => console.error("Error notificando lista de espera:", e.message));
     }
 
+    if (estado === "cancelado" && turnoExistente.estado !== "cancelado") {
+      crearNotificacion({
+        slug: slugClean,
+        tipo: "turno_cancelado",
+        titulo: "Turno cancelado",
+        mensaje: `Se canceló el turno de ${turnoExistente.nombre || "un cliente"} del ${turnoExistente.fecha} a las ${turnoExistente.hora?.slice(0, 5) || ""}hs.`,
+        data: { turno_id: id, fecha: turnoExistente.fecha },
+      });
+    }
+
     invalidateCache(slugClean);
     console.log(`✅ Turno ${id} → ${estado} (${slugClean})`);
     res.json({ success: true, turno: turnoActualizado });
   } catch (e) {
     console.error("Error en PUT /turnos/:id:", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// NOTIFICACIONES — Bandeja de entrada del panel
+// ══════════════════════════════════════════════════════════════
+
+// GET /notificaciones/:slug  → lista + contador de no leídas
+app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { data, error } = await supabase.from("notificaciones")
+      .select("*").eq("slug", slug)
+      .order("created_at", { ascending: false }).limit(50);
+    if (error) throw error;
+    const noLeidas = (data || []).filter((n) => !n.leida).length;
+    res.json({ success: true, notificaciones: data || [], no_leidas: noLeidas });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// PUT /notificaciones/:id/leida
+app.put("/notificaciones/:id/leida", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slug = cleanSlug(req.body?.slug || req.auth.slug);
+    const { error } = await supabase.from("notificaciones")
+      .update({ leida: true }).eq("id", id).eq("slug", slug);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// PUT /notificaciones/marcar-todas/:slug
+app.put("/notificaciones/marcar-todas/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { error } = await supabase.from("notificaciones")
+      .update({ leida: true }).eq("slug", slug).eq("leida", false);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// DELETE /notificaciones/:id
+app.delete("/notificaciones/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
+    const { error } = await supabase.from("notificaciones").delete().eq("id", id).eq("slug", slugClean);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -2467,6 +2620,15 @@ app.get("/oauth-callback", async (req, res) => {
         .eq("slug", slugClean);
       if (updError) { console.error("Error guardando token MP:", updError.message); return res.redirect(`${PANEL_URL}?status=mp_error&u=${slugClean}`); }
       invalidateCache(slugClean);
+
+      crearNotificacion({
+        slug: slugClean,
+        tipo: "sistema",
+        titulo: "Mercado Pago conectado",
+        mensaje: "Ya podés cobrar señas o el total de tus turnos desde el link de reserva.",
+        data: { clave: "mp_conectado" },
+      });
+
       return res.redirect(`${PANEL_URL}?status=mp_success&u=${slugClean}`);
     }
     res.redirect(`${PANEL_URL}?status=mp_error&u=${slugClean}`);
@@ -2506,6 +2668,15 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
         fechaHora: `${fecha} ${hora}`,
         slug, payment_id, monto,
       });
+
+      crearNotificacion({
+        slug,
+        tipo: "sistema",
+        titulo: "⚠️ Conflicto de sobreventa",
+        mensaje: `Un pago de ${nombre?.trim() || "un cliente"} se aprobó para el ${fecha} ${hora}hs pero el cupo ya estaba lleno. Requiere que lo revises manualmente.`,
+        data: { fecha, hora, payment_id, monto },
+      });
+
       invalidateCache(slug);
       return;
     }
@@ -2545,6 +2716,15 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
         businessName:  user?.business_name,
         fechaHora:     `${fecha} ${hora}`,
         servicio:      servicio_nombre || "",
+      });
+
+      // Notificación in-app: turno pagado
+      crearNotificacion({
+        slug,
+        tipo: "pago_aprobado",
+        titulo: "Turno pagado",
+        mensaje: `${nombre?.trim() || "Cliente"} pagó ${metodo_pago === "sena" ? "la seña" : "el turno completo"} para el ${fecha} a las ${hora}hs.`,
+        data: { fecha, hora, monto },
       });
     }
   }
@@ -2652,6 +2832,14 @@ async function procesarRenovacion(payData) {
       body: JSON.stringify({ action: "renovacionAprobada", adminEmail: user.email, nombre: user.nombre_persona || "Cliente", slug, nuevaFecha }),
     }).catch((e) => console.error("Error mail renovación:", e.message));
   }
+
+  crearNotificacion({
+    slug,
+    tipo: "sistema",
+    titulo: "Renovación aprobada",
+    mensaje: `Tu plan Premium se renovó correctamente. Nueva fecha de vencimiento: ${nuevaFecha}.`,
+    data: { nuevaFecha },
+  });
 }
 
 app.post("/webhook/renovacion", async (req, res) => {
@@ -2748,6 +2936,8 @@ app.post("/admin/whatsapp/test", requireAdminKey, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // CRON — Verificación de vencimientos
+// Además de suspender/reactivar negocios, ahora genera una
+// notificación in-app cuando faltan 5 días o 1 día para vencer.
 // ══════════════════════════════════════════════════════════════
 app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
   try {
@@ -2773,7 +2963,49 @@ app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
       slugsReactivar.forEach((s) => invalidateCache(s));
     }
 
-    res.json({ success: true, fecha: hoyISO, suspendidos: slugs, reactivados: slugsReactivar });
+    // Avisos in-app para negocios que están por vencer (5 días o 1 día)
+    const { data: porVencer } = await supabase.from("usuarios")
+      .select("slug, fecha_vencimiento").eq("activo", "true").eq("estado_suscripcion", "activo")
+      .not("fecha_vencimiento", "is", null);
+
+    const avisados = [];
+    for (const u of (porVencer || [])) {
+      const dias = diasHastaVencer(u.fecha_vencimiento);
+      if (dias === 5 || dias === 1) {
+        await crearNotificacion({
+          slug: u.slug,
+          tipo: "vencimiento",
+          titulo: "Tu suscripción está por vencer",
+          mensaje: dias === 1
+            ? "Tu plan Premium vence mañana. Renová para no perder acceso al panel."
+            : "Tu plan Premium vence en 5 días. Renová cuando quieras desde el panel.",
+          data: { fecha_vencimiento: u.fecha_vencimiento, dias_restantes: dias },
+        });
+        avisados.push(u.slug);
+      }
+    }
+
+    res.json({ success: true, fecha: hoyISO, suspendidos: slugs, reactivados: slugsReactivar, avisados_vencimiento: avisados });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// CRON — Generar tips para negocios existentes
+// Corré esto una vez por día (o por semana) para que los negocios
+// ya creados también reciban recomendaciones, no solo los nuevos.
+// ══════════════════════════════════════════════════════════════
+app.get("/cron/generar-tips", requireAdminKey, async (req, res) => {
+  try {
+    const { data: negocios, error } = await supabase.from("usuarios")
+      .select("slug").eq("activo", "true");
+    if (error) throw error;
+
+    for (const n of (negocios || [])) {
+      await generarTips(n.slug);
+    }
+    res.json({ success: true, procesados: (negocios || []).length });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -2797,9 +3029,9 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`
   ╔═══════════════════════════════════════════════╗
-  ║   Turnits API v13.6                            ║
-  ║   Nuevo: lista de espera + notificación de     ║
-  ║   cupo liberado (email + WhatsApp)             ║
+  ║   Turnits API v13.7                            ║
+  ║   Nuevo: bandeja de entrada / notificaciones   ║
+  ║   in-app (Realtime) + tips de buenas prácticas ║
   ║   WhatsApp (${WHATSAPP_HABILITADO ? "configurada" : "SIN configurar"})               ║
   ║   Puerto: ${PORT}                              ║
   ╚═══════════════════════════════════════════════╝
