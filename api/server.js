@@ -1557,6 +1557,12 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
     }]).select().single();
     if (turnoError) throw turnoError;
 
+    crearNotificacion({
+      slug: slugClean, tipo: "turno_nuevo", titulo: "Nuevo turno reservado",
+      mensaje: `${name.trim()} reservó para el ${fecha} a las ${hora}hs`,
+      data: { turno_id: turno.id, fecha, hora },
+    });
+    
     enviarMailTurno({
       adminEmail:    user.email,
       emailCliente:  email?.trim().toLowerCase() || "",
@@ -2784,6 +2790,12 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       if (turnoError.code === "23505") { console.log(`⚠️ Turno duplicado bloqueado por DB: ${payment_id}`); }
       else throw turnoError;
     } else {
+            crearNotificacion({
+        slug, tipo: "pago_aprobado", titulo: "Pago aprobado",
+        mensaje: `${nombre?.trim() || "Cliente"} pagó $${monto} — turno ${fecha} ${hora}hs`,
+        data: { fecha, hora, monto },
+      });
+      
       if (user?.email) {
         const saldoRestante = metodo_pago === "sena" && precio_servicio > monto ? precio_servicio - monto : 0;
         enviarMailTurno({
