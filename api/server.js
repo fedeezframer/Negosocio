@@ -1316,6 +1316,95 @@ app.get("/cron/limpiar-lista-espera", requireAdminKey, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+// NOTIFICACIONES
+// ══════════════════════════════════════════════════════════════
+app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    let query = supabase.from("notificaciones").select("*").eq("slug", slug)
+      .order("created_at", { ascending: false }).limit(50);
+    if (req.query.no_leidas === "true") query = query.eq("leida", false);
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const { count } = await supabase.from("notificaciones").select("id", { count: "exact", head: true })
+      .eq("slug", slug).eq("leida", false);
+
+    res.json({ success: true, notificaciones: data || [], no_leidas: count || 0 });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.put("/notificaciones/:id/leida", requireAuth, async (req, res) => {
+  try {
+    const slugClean = cleanSlug(req.body?.slug || req.auth.slug);
+    const { error } = await supabase.from("notificaciones")
+      .update({ leida: true }).eq("id", req.params.id).eq("slug", slugClean);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.put("/notificaciones/:slug/leer-todas", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { error } = await supabase.from("notificaciones")
+      .update({ leida: true }).eq("slug", slug).eq("leida", false);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.delete("/notificaciones/:id", requireAuth, async (req, res) => {
+  try {
+    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
+    const { error } = await supabase.from("notificaciones")
+      .delete().eq("id", req.params.id).eq("slug", slugClean);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// CRON — Recordatorios de turnos de mañana
+// Llamar 1 vez al día (ej. 8:00 ART) desde Render Cron Job o
+// cron-job.org, con header x-api-key: ADMIN_SECRET
+// ══════════════════════════════════════════════════════════════
+app.get("/cron/recordatorios-turnos", requireAdminKey, async (req, res) => {
+  try {
+    const ahoraArg = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
+    const manana = new Date(ahoraArg); manana.setDate(manana.getDate() + 1);
+    const mananaISO = manana.toISOString().split("T")[0];
+
+    const { data: turnos, error } = await supabase.from("turnos")
+      .select("slug, nombre, hora").eq("fecha", mananaISO).neq("estado", "cancelado")
+      .order("hora", { ascending: true });
+    if (error) throw error;
+
+    const porNegocio = {};
+    (turnos || []).forEach((t) => { (porNegocio[t.slug] ||= []).push(t); });
+
+    for (const [slug, lista] of Object.entries(porNegocio)) {
+      await crearNotificacion({
+        slug, tipo: "recordatorio", titulo: `Tenés ${lista.length} turno(s) mañana`,
+        mensaje: lista.slice(0, 3).map(t => `${t.hora.slice(0,5)} - ${t.nombre}`).join(" · ") + (lista.length > 3 ? "…" : ""),
+        data: { fecha: mananaISO, cantidad: lista.length },
+      });
+    }
+    res.json({ success: true, negocios_notificados: Object.keys(porNegocio).length });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
 // SERVICIOS — ADMIN — CRUD
 // ══════════════════════════════════════════════════════════════
 app.get("/admin/servicios/:slug", requireAuth, async (req, res) => {
