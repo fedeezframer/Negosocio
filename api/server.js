@@ -1556,12 +1556,6 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       pago_estado:     "sin_pago",
     }]).select().single();
     if (turnoError) throw turnoError;
-
-    crearNotificacion({
-      slug: slugClean, tipo: "turno_nuevo", titulo: "Nuevo turno reservado",
-      mensaje: `${name.trim()} reservó para el ${fecha} a las ${hora}hs`,
-      data: { turno_id: turno.id, fecha, hora },
-    });
     
     enviarMailTurno({
       adminEmail:    user.email,
@@ -1699,65 +1693,6 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
     res.json({ success: true, turno: turnoActualizado });
   } catch (e) {
     console.error("Error en PUT /turnos/:id:", e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════
-// NOTIFICACIONES — Bandeja de entrada del panel
-// ══════════════════════════════════════════════════════════════
-
-// GET /notificaciones/:slug  → lista + contador de no leídas
-app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
-  try {
-    const slug = cleanSlug(req.params.slug);
-    const { data, error } = await supabase.from("notificaciones")
-      .select("*").eq("slug", slug)
-      .order("created_at", { ascending: false }).limit(50);
-    if (error) throw error;
-    const noLeidas = (data || []).filter((n) => !n.leida).length;
-    res.json({ success: true, notificaciones: data || [], no_leidas: noLeidas });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// PUT /notificaciones/:id/leida
-app.put("/notificaciones/:id/leida", requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const slug = cleanSlug(req.body?.slug || req.auth.slug);
-    const { error } = await supabase.from("notificaciones")
-      .update({ leida: true }).eq("id", id).eq("slug", slug);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// PUT /notificaciones/marcar-todas/:slug
-app.put("/notificaciones/marcar-todas/:slug", requireAuth, async (req, res) => {
-  try {
-    const slug = cleanSlug(req.params.slug);
-    const { error } = await supabase.from("notificaciones")
-      .update({ leida: true }).eq("slug", slug).eq("leida", false);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// DELETE /notificaciones/:id
-app.delete("/notificaciones/:id", requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
-    const { error } = await supabase.from("notificaciones").delete().eq("id", id).eq("slug", slugClean);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -2790,14 +2725,7 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       if (turnoError.code === "23505") { console.log(`⚠️ Turno duplicado bloqueado por DB: ${payment_id}`); }
       else throw turnoError;
     } else {
-            crearNotificacion({
-        slug, tipo: "pago_aprobado", titulo: "Pago aprobado",
-        mensaje: `${nombre?.trim() || "Cliente"} pagó $${monto} — turno ${fecha} ${hora}hs`,
-        data: { fecha, hora, monto },
-      });
-      
       if (user?.email) {
-        const saldoRestante = metodo_pago === "sena" && precio_servicio > monto ? precio_servicio - monto : 0;
         enviarMailTurno({
           adminEmail:    user.email,
           emailCliente:  email?.trim().toLowerCase() || "",
@@ -2819,12 +2747,12 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
         servicio:      servicio_nombre || "",
       });
 
-      // Notificación in-app: turno pagado
+      // Notificación in-app: turno pagado (una sola, con servicio + monto)
       crearNotificacion({
         slug,
         tipo: "pago_aprobado",
         titulo: "Turno pagado",
-        mensaje: `${nombre?.trim() || "Cliente"} pagó ${metodo_pago === "sena" ? "la seña" : "el turno completo"} para el ${fecha} a las ${hora}hs.`,
+        mensaje: `${nombre?.trim() || "Cliente"} pagó ${metodo_pago === "sena" ? "la seña" : "el turno completo"} (${servicio_nombre ? servicio_nombre + " — " : ""}$${monto}) para el ${fecha} a las ${hora}hs.`,
         data: { fecha, hora, monto },
       });
     }
