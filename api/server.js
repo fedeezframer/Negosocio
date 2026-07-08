@@ -16,7 +16,7 @@ const app = express();
 app.set("trust proxy", 1);
 
 const APPS_SCRIPT_URL =
-  "https://script.google.com/macros/s/AKfycby3A-gfCMQxe9x1-VBiLCoAsKOOT_NtjMisc8OcoRKbKXwIjjjdY64OmRUDV8PFxunI/exec";
+  "https://script.google.com/macros/s/AKfycbxH_z_yM-PMGrVwSsF0aUVmqp8X-3Km-9gppSu1vVUljNZPi3m8GommUv7BS2NlWu41/exec";
 
 const BCRYPT_ROUNDS  = 10;
 const CACHE_DURATION = 20_000;
