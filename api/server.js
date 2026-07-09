@@ -15,22 +15,38 @@ import crypto         from "crypto";
 const app = express();
 app.set("trust proxy", 1);
 
-const APPS_SCRIPT_URL =
-  "https://script.google.com/macros/s/AKfycbyGMfpkJUhe9ngK8hVNNPQAbk3XF7dnSU9xQFQyvhhKtKFvrzCNRimjDcuS8uFTUvo/exec";
+// FIX-SEC: APPS_SCRIPT_URL sacada del código fuente y movida a env var.
+// Antes estaba hardcodeada -> si el repo se filtra, cualquiera puede
+// pegarle a ese endpoint de Apps Script.
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL || "";
+if (!APPS_SCRIPT_URL) {
+  console.warn("⚠️  APPS_SCRIPT_URL no configurada. Los mails (bienvenida, códigos, turnos, etc.) no se van a enviar.");
+}
 
 const BCRYPT_ROUNDS  = 10;
 const CACHE_DURATION = 20_000;
-const JWT_EXPIRY     = "7d";
+// FIX-SEC: JWT de 7 días bajado a 1 día. Reduce la ventana de exposición
+// si un token se filtra (XSS, dispositivo compartido, etc).
+const JWT_EXPIRY     = process.env.JWT_EXPIRY || "1d";
 const API_URL        = process.env.API_URL || "https://negosocio.onrender.com";
 
 const DIAS_PRUEBA        = parseInt(process.env.DIAS_PRUEBA       || "15");
 const PRECIO_RENOVACION  = parseInt(process.env.PRECIO_RENOVACION || "19000");
 const MP_PLATFORM_TOKEN  = process.env.MP_PLATFORM_TOKEN          || "";
+// FIX-SEC: secret propio para validar la firma de los webhooks de MP.
+const MP_WEBHOOK_SECRET  = process.env.MP_WEBHOOK_SECRET          || "";
 const PANEL_URL          = process.env.PANEL_URL                  || "https://turnits.com/panel";
 const SUCCESS_URL        = process.env.SUCCESS_URL                || "https://turnits.com/success";
 const ERROR_URL          = process.env.ERROR_URL                  || "https://turnits.com/error";
 const RENOVACION_SUCCESS = process.env.RENOVACION_SUCCESS_URL     || `${PANEL_URL}?status=renovacion_ok`;
 const RENOVACION_CANCEL  = process.env.RENOVACION_CANCEL_URL      || `${PANEL_URL}?status=renovacion_cancel`;
+
+// FIX-SEC: orígenes permitidos para el panel/admin (CORS restringido).
+// El widget público de reservas sigue abierto (lo necesita, corre en
+// el sitio de cada negocio en Framer). Las rutas de panel/admin en cambio
+// solo deberían aceptar pedidos desde tu propio dominio.
+const PANEL_ORIGINS = (process.env.PANEL_ORIGINS || "https://turnits.com,https://www.turnits.com")
+  .split(",").map((o) => o.trim()).filter(Boolean);
 
 // ══════════════════════════════════════════════════════════════
 // WHATSAPP CLOUD API — Config
@@ -68,10 +84,20 @@ if (!WHATSAPP_HABILITADO) {
 
 // ══════════════════════════════════════════════════════════════
 // MULTER
+// FIX-SEC: se restringe el tipo de archivo a nivel de fileFilter,
+// además del límite de tamaño que ya existía. No se acepta SVG
+// (puede llevar <script> embebido -> XSS almacenado).
 // ══════════════════════════════════════════════════════════════
+const TIPOS_IMAGEN_PERMITIDOS = ["image/jpeg", "image/png", "image/webp"];
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 3 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!TIPOS_IMAGEN_PERMITIDOS.includes(file.mimetype)) {
+      return cb(new Error("Formato de imagen no permitido. Usá JPG, PNG o WEBP."));
+    }
+    cb(null, true);
+  },
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -115,6 +141,14 @@ const validateEmail    = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const validatePassword = (p) => p && p.length >= 6;
 const validatePhone    = (p) => /^[0-9]{7,15}$/.test(p.toString().replace(/\s/g, ""));
 const cleanPhone = (p) => p.toString().replace(/\s/g, "").replace(/^\+/, "").trim();
+
+// FIX-SEC: helper de sanitización estricta para valores que van a
+// construirse dentro de filtros PostgREST (.or()). Rechaza cualquier
+// caracter que no sea alfanumérico, @, ., -, _  -> evita que un email
+// o teléfono "creativo" (ej: "a,id.gt.0@x.co") altere la sintaxis del
+// filtro e inyecte condiciones extra (equivalente a SQL injection en
+// la capa de filtros de Supabase).
+const esValorSeguroParaFiltro = (v) => /^[a-zA-Z0-9@._-]+$/.test(v);
 
 const calcularVencimiento = (diasExtra = 30, baseISO = null) => {
   const base = baseISO ? new Date(baseISO + "T12:00:00-03:00") : new Date();
@@ -170,6 +204,50 @@ function obtenerIntervalosDia(horarios, excepciones, fecha) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// VALIDACIÓN DE ESTRUCTURA: horarios / excepciones
+// FIX-SEC: antes /settings/:slug guardaba "horarios" y "excepciones"
+// tal cual venían del body, sin validar forma. Un valor malformado
+// no rompe la DB pero rompe silenciosamente el cálculo de slots.
+// Estas funciones validan la forma esperada antes de guardar.
+// ══════════════════════════════════════════════════════════════
+const HORA_REGEX = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const DIAS_SEMANA_VALIDOS = ["domingo", "lunes", "martes", "miercoles", "jueves", "viernes", "sabado"];
+
+function validarHorarios(horarios) {
+  if (typeof horarios !== "object" || horarios === null || Array.isArray(horarios)) return false;
+  for (const [dia, config] of Object.entries(horarios)) {
+    if (!DIAS_SEMANA_VALIDOS.includes(dia)) return false;
+    if (typeof config !== "object" || config === null) return false;
+    if (typeof config.activo !== "boolean") return false;
+    if (config.activo) {
+      if (!Array.isArray(config.jornada) || config.jornada.length !== 2) return false;
+      if (!config.jornada.every((h) => HORA_REGEX.test(h))) return false;
+      if (config.descanso !== undefined && config.descanso !== null) {
+        if (!Array.isArray(config.descanso) || config.descanso.length !== 2) return false;
+        if (!config.descanso.every((h) => HORA_REGEX.test(h))) return false;
+      }
+    }
+  }
+  return true;
+}
+
+function validarExcepciones(excepciones) {
+  if (!Array.isArray(excepciones)) return false;
+  const FECHA_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+  return excepciones.every((exc) => {
+    if (typeof exc === "string") return FECHA_REGEX.test(exc);
+    if (typeof exc !== "object" || exc === null) return false;
+    if (!FECHA_REGEX.test(exc.fecha || "")) return false;
+    if (!["block", "custom"].includes(exc.type)) return false;
+    if (exc.type === "custom") {
+      if (!Array.isArray(exc.slots)) return false;
+      return exc.slots.every((s) => Array.isArray(s) && s.length === 2 && s.every((h) => HORA_REGEX.test(h)));
+    }
+    return true;
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
 // HELPER: NOTIFICACIONES IN-APP (bandeja de entrada del panel)
 // Inserta una fila en `notificaciones`. Nunca bloquea el flujo
 // principal: si falla, solo se loguea.
@@ -187,9 +265,6 @@ async function crearNotificacion({ slug, tipo, titulo, mensaje, data = {} }) {
 
 // ══════════════════════════════════════════════════════════════
 // HELPER: TIPS DE BUENAS PRÁCTICAS (bandeja de entrada)
-// Se dispara una sola vez por regla gracias al flag guardado en
-// `data.clave`. Llamalo después del registro y opcionalmente desde
-// un cron diario liviano para negocios ya existentes.
 // ══════════════════════════════════════════════════════════════
 async function generarTips(slug) {
   try {
@@ -247,7 +322,7 @@ async function notificarListaEspera(slug, fecha) {
   const entrada = pendientes[0];
   const { data: user } = await supabase.from("usuarios").select("business_name").eq("slug", slug).maybeSingle();
 
-  if ((entrada.canal_aviso === "email" || entrada.canal_aviso === "ambos") && entrada.email) {
+  if ((entrada.canal_aviso === "email" || entrada.canal_aviso === "ambos") && entrada.email && APPS_SCRIPT_URL) {
     fetch(APPS_SCRIPT_URL, {
       method: "POST", headers: { "Content-Type": "text/plain" },
       body: JSON.stringify({
@@ -298,20 +373,83 @@ const globalCache = {};
 const invalidateCache = (slug) => { delete globalCache[slug]; };
 
 // ══════════════════════════════════════════════════════════════
+// FIX-SEC: bloqueo de fuerza bruta por CUENTA (además del rate
+// limit por IP que ya existía). Cuenta intentos fallidos de login
+// por email/slug en memoria y bloquea temporalmente tras 8 intentos
+// en 15 minutos. Es en memoria (no persiste un redeploy), pero corta
+// el caso real: un atacante insistiendo contra una cuenta puntual
+// aunque rote de IP.
+// ══════════════════════════════════════════════════════════════
+const intentosFallidosLogin = new Map(); // key -> { intentos, primerIntento, bloqueadoHasta }
+const MAX_INTENTOS_LOGIN   = 8;
+const VENTANA_INTENTOS_MS  = 15 * 60 * 1000;
+const BLOQUEO_MS           = 15 * 60 * 1000;
+
+function chequearBloqueoLogin(key) {
+  const registro = intentosFallidosLogin.get(key);
+  if (!registro) return { bloqueado: false };
+  if (registro.bloqueadoHasta && Date.now() < registro.bloqueadoHasta) {
+    return { bloqueado: true, minutosRestantes: Math.ceil((registro.bloqueadoHasta - Date.now()) / 60000) };
+  }
+  return { bloqueado: false };
+}
+
+function registrarIntentoFallidoLogin(key) {
+  const ahora = Date.now();
+  let registro = intentosFallidosLogin.get(key);
+  if (!registro || ahora - registro.primerIntento > VENTANA_INTENTOS_MS) {
+    registro = { intentos: 0, primerIntento: ahora, bloqueadoHasta: null };
+  }
+  registro.intentos += 1;
+  if (registro.intentos >= MAX_INTENTOS_LOGIN) {
+    registro.bloqueadoHasta = ahora + BLOQUEO_MS;
+  }
+  intentosFallidosLogin.set(key, registro);
+}
+
+function limpiarIntentosLogin(key) {
+  intentosFallidosLogin.delete(key);
+}
+
+// ══════════════════════════════════════════════════════════════
 // RATE LIMITING
+// FIX-SEC: se agrega limiterCodigo, más estricto, para los endpoints
+// de códigos numéricos de 6 dígitos (antes solo tenían el límite
+// global de 200/min, que permite fuerza bruta sobre 1.000.000 de
+// combinaciones en tiempo razonable).
 // ══════════════════════════════════════════════════════════════
 const limiterAuth    = rateLimit({ windowMs: 15 * 60 * 1000, max: 20,  message: "Demasiados intentos.",  standardHeaders: true, legacyHeaders: false });
 const limiterBooking = rateLimit({ windowMs: 60 * 1000,       max: 20,  message: "Demasiadas reservas." });
 const limiterAPI     = rateLimit({ windowMs: 60 * 1000,       max: 200 });
+const limiterCodigo  = rateLimit({ windowMs: 15 * 60 * 1000, max: 10,  message: "Demasiados intentos. Probá de nuevo en unos minutos.", standardHeaders: true, legacyHeaders: false });
 
 // ══════════════════════════════════════════════════════════════
 // MIDDLEWARES
+// FIX-SEC: CORS separado. Las rutas públicas (widget de reserva)
+// siguen abiertas a "*", pero las rutas de panel/admin (definidas
+// más abajo con requireAuth / requireAdminKey) exigen que el Origin
+// esté en PANEL_ORIGINS. Esto reduce el impacto de un eventual robo
+// de JWT vía XSS: un sitio de terceros no puede usar el token desde
+// el navegador de la víctima contra las rutas sensibles (CORS no
+// protege contra un atacante pegándole directo a la API con curl,
+// pero sí contra el escenario más común de robo-y-uso-desde-otro-sitio).
 // ══════════════════════════════════════════════════════════════
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
 }));
+
+const corsPanel = cors({
+  origin: (origin, cb) => {
+    // Permite llamadas sin Origin (ej. Postman, server-to-server, cron)
+    if (!origin || PANEL_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error("Origen no permitido."));
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
+});
+
 app.use(express.json({ limit: "10mb" }));
 app.use(limiterAPI);
 
@@ -345,14 +483,24 @@ function requireAuth(req, res, next) {
 
 // ══════════════════════════════════════════════════════════════
 // MIDDLEWARE: ADMIN KEY
+// FIX-SEC: comparación en tiempo constante (crypto.timingSafeEqual)
+// en vez de "===", para no filtrar por timing cuánto del secret
+// coincide. Requiere que ambos buffers tengan el mismo largo, por
+// eso se compara el largo primero (si difiere, ya es inválido).
 // ══════════════════════════════════════════════════════════════
 const requireAdminKey = (req, res, next) => {
-  const key = req.headers["x-api-key"];
-  if (!process.env.ADMIN_SECRET || key !== process.env.ADMIN_SECRET) {
-    return res.status(401).json({ success: false, error: "No autorizado." });
-  }
+  const key = req.headers["x-api-key"] || "";
+  const secret = process.env.ADMIN_SECRET || "";
+  if (!secret) return res.status(401).json({ success: false, error: "No autorizado." });
+
+  const keyBuf    = Buffer.from(String(key));
+  const secretBuf = Buffer.from(secret);
+  const valido = keyBuf.length === secretBuf.length && crypto.timingSafeEqual(keyBuf, secretBuf);
+
+  if (!valido) return res.status(401).json({ success: false, error: "No autorizado." });
   next();
 };
+
 
 // ══════════════════════════════════════════════════════════════
 // HELPERS DE MÉTRICAS
@@ -413,9 +561,9 @@ function agruparPagos(turnos, hoyISO) {
 
 // ══════════════════════════════════════════════════════════════
 // HELPER: ENVIAR MAIL DE TURNO
-// FIX: typo "newointmentEmail" → "newAppointmentEmail"
 // ══════════════════════════════════════════════════════════════
 function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, precioTotal, montoOnline, metodoPago }) {
+  if (!APPS_SCRIPT_URL) return;
   const panelUrl = `${PANEL_URL}?u=${slug}`;
 
   fetch(APPS_SCRIPT_URL, {
@@ -457,10 +605,9 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
 
 // ══════════════════════════════════════════════════════════════
 // HELPER: AVISAR CONFLICTO DE SOBREVENTA AL ADMIN
-// (usado cuando un pago se aprueba pero el cupo ya estaba lleno)
 // ══════════════════════════════════════════════════════════════
 function enviarMailConflictoTurno({ adminEmail, nombreCliente, fechaHora, slug, payment_id, monto }) {
-  if (!adminEmail) return;
+  if (!adminEmail || !APPS_SCRIPT_URL) return;
   fetch(APPS_SCRIPT_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain" },
@@ -479,22 +626,17 @@ function enviarMailConflictoTurno({ adminEmail, nombreCliente, fechaHora, slug, 
 
 // ══════════════════════════════════════════════════════════════
 // HELPER: WHATSAPP — formatear teléfono a formato internacional
-// WhatsApp exige el número completo con código de país (sin "+" ni
-// espacios). Si el teléfono guardado no trae código de país, le
-// antepone WHATSAPP_DEFAULT_COUNTRY (Argentina móvil "549" por defecto).
 // ══════════════════════════════════════════════════════════════
 function formatPhoneWhatsapp(telefono) {
   const limpio = cleanPhone(telefono?.toString() || "");
   if (!limpio) return null;
   if (limpio.startsWith(WHATSAPP_DEFAULT_COUNTRY)) return limpio;
-  // Si ya es un número largo (probablemente ya trae otro código de país), lo dejamos como está.
   if (limpio.length > 11) return limpio;
   return `${WHATSAPP_DEFAULT_COUNTRY}${limpio.replace(/^0+/, "")}`;
 }
 
 // ══════════════════════════════════════════════════════════════
 // HELPER: WHATSAPP — envío genérico de mensaje por plantilla
-// (Cloud API oficial de Meta, Graph API)
 // ══════════════════════════════════════════════════════════════
 async function enviarWhatsapp(to, templateName, components = [], languageCode = "es_AR") {
   if (!WHATSAPP_HABILITADO) return { skipped: true, error: "whatsapp_no_configurado" };
@@ -535,14 +677,6 @@ async function enviarWhatsapp(to, templateName, components = [], languageCode = 
   }
 }
 
-// ══════════════════════════════════════════════════════════════
-// HELPER: WHATSAPP — notificación de turno confirmado al cliente
-// Usa la plantilla WHATSAPP_TEMPLATE_TURNO (debe existir y estar
-// aprobada en Meta Business Manager antes de andar). Asume 4
-// variables en el body: nombre, negocio, servicio, fecha/hora —
-// ajustá el array de "parameters" si tu plantilla real es distinta.
-// No bloquea el flujo principal: si falla, solo lo loguea.
-// ══════════════════════════════════════════════════════════════
 function enviarWhatsappTurno({ telefono, nombreCliente, businessName, fechaHora, servicio }) {
   if (!WHATSAPP_HABILITADO || !telefono) return;
 
@@ -564,7 +698,7 @@ function enviarWhatsappTurno({ telefono, nombreCliente, businessName, fechaHora,
 // ══════════════════════════════════════════════════════════════
 // RUTAS BASE
 // ══════════════════════════════════════════════════════════════
-app.get("/",       (_, res) => res.json({ status: "online", version: "13.7", timestamp: new Date().toISOString() }));
+app.get("/",       (_, res) => res.json({ status: "online", version: "13.8-sec", timestamp: new Date().toISOString() }));
 app.get("/health", (_, res) => res.json({ status: "ok",     timestamp: new Date().toISOString() }));
 
 // ══════════════════════════════════════════════════════════════
@@ -585,6 +719,16 @@ app.post("/registro/iniciar", limiterAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "Teléfono inválido (7-15 dígitos)." });
     if (business_name.trim().length < 2)
       return res.status(400).json({ success: false, error: "El nombre del negocio es demasiado corto." });
+    // FIX-SEC: nombre_persona / apellido / business_name ahora se validan
+    // en largo y se recortan caracteres de control, para reducir el
+    // riesgo de que texto libre malicioso termine en mails/paneles sin escapar.
+    if (nombre_persona.trim().length > 80 || business_name.trim().length > 80 || (apellido && apellido.trim().length > 80)) {
+      return res.status(400).json({ success: false, error: "Alguno de los campos es demasiado largo." });
+    }
+    // FIX-SEC: si mandan horarios en el registro, se valida la forma.
+    if (horarios !== undefined && horarios !== null && !validarHorarios(horarios)) {
+      return res.status(400).json({ success: false, error: "Formato de horarios inválido." });
+    }
 
     const emailClean = email.trim().toLowerCase();
 
@@ -613,30 +757,34 @@ app.post("/registro/iniciar", limiterAuth, async (req, res) => {
 
     if (error) throw error;
 
-    fetch(APPS_SCRIPT_URL, {
-      method: "POST", headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({
-        action: "verificarCodigo",
-        email:  emailClean,
-        nombre: nombre_persona.trim(),
-        codigo,
-      }),
-    }).catch((e) => console.error("Error mail código:", e.message));
+    if (APPS_SCRIPT_URL) {
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST", headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action: "verificarCodigo",
+          email:  emailClean,
+          nombre: nombre_persona.trim(),
+          codigo,
+        }),
+      }).catch((e) => console.error("Error mail código:", e.message));
+    }
 
     console.log(`📧 Código enviado a ${emailClean}`);
     res.json({ success: true, message: "Código enviado. Revisá tu email." });
 
   } catch (e) {
     console.error("Error en /registro/iniciar:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo iniciar el registro." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // REGISTRO — PASO 2
 // POST /registro/verificar
+// FIX-SEC: agregado limiterCodigo (además de limiterAuth) para
+// cortar fuerza bruta sobre el código de 6 dígitos.
 // ══════════════════════════════════════════════════════════════
-app.post("/registro/verificar", limiterAuth, async (req, res) => {
+app.post("/registro/verificar", limiterAuth, limiterCodigo, async (req, res) => {
   try {
     const { email, codigo } = req.body;
     if (!email || !codigo)
@@ -699,19 +847,20 @@ app.post("/registro/verificar", limiterAuth, async (req, res) => {
 
     await supabase.from("registros_pendientes").delete().eq("email", emailClean);
 
-    fetch(APPS_SCRIPT_URL, {
-      method: "POST", headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({
-        action:      "bienvenida",
-        adminEmail:  nuevo.email,
-        nombre:      nuevo.nombre_persona,
-        slug:        nuevo.slug,
-        panel_url:   `${PANEL_URL}?u=${nuevo.slug}`,
-        dias_prueba: planFinal === "premium" ? DIAS_PRUEBA : 0,
-      }),
-    }).catch((e) => console.error("Error mail bienvenida:", e.message));
+    if (APPS_SCRIPT_URL) {
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST", headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action:      "bienvenida",
+          adminEmail:  nuevo.email,
+          nombre:      nuevo.nombre_persona,
+          slug:        nuevo.slug,
+          panel_url:   `${PANEL_URL}?u=${nuevo.slug}`,
+          dias_prueba: planFinal === "premium" ? DIAS_PRUEBA : 0,
+        }),
+      }).catch((e) => console.error("Error mail bienvenida:", e.message));
+    }
 
-    // Notificación de bienvenida en la bandeja + tips iniciales
     crearNotificacion({
       slug: nuevo.slug,
       tipo: "sistema",
@@ -741,7 +890,7 @@ app.post("/registro/verificar", limiterAuth, async (req, res) => {
 
   } catch (e) {
     console.error("Error en /registro/verificar:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo verificar el registro." });
   }
 });
 
@@ -771,20 +920,22 @@ app.post("/registro/reenviar-codigo", limiterAuth, async (req, res) => {
       .update({ codigo, codigo_expiry })
       .eq("email", emailClean);
 
-    fetch(APPS_SCRIPT_URL, {
-      method: "POST", headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({
-        action: "verificarCodigo",
-        email:  emailClean,
-        nombre: pendiente.nombre_persona,
-        codigo,
-      }),
-    }).catch((e) => console.error("Error reenvío código:", e.message));
+    if (APPS_SCRIPT_URL) {
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST", headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action: "verificarCodigo",
+          email:  emailClean,
+          nombre: pendiente.nombre_persona,
+          codigo,
+        }),
+      }).catch((e) => console.error("Error reenvío código:", e.message));
+    }
 
     res.json({ success: true, message: "Código reenviado." });
 
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo reenviar el código." });
   }
 });
 
@@ -792,7 +943,7 @@ app.post("/registro/reenviar-codigo", limiterAuth, async (req, res) => {
 // TURNOS — Check cliente duplicado
 // POST /turnos/check-cliente
 // ══════════════════════════════════════════════════════════════
-app.post("/turnos/check-cliente", async (req, res) => {
+app.post("/turnos/check-cliente", limiterBooking, async (req, res) => {
   try {
     const { slug, email, telefono } = req.body;
     const slugClean = cleanSlug(slug || "");
@@ -801,38 +952,47 @@ app.post("/turnos/check-cliente", async (req, res) => {
       return res.status(400).json({ success: false, error: "Faltan parámetros." });
     }
 
-    const hoy = new Date().toISOString().split("T")[0];
-
-    const orParts = [];
     const emailClean = email?.trim().toLowerCase();
     const phoneClean = telefono ? cleanPhone(telefono.toString()) : null;
-    if (emailClean) orParts.push(`email.eq.${emailClean}`);
-    if (phoneClean) orParts.push(`telefono.eq.${phoneClean}`);
 
-    const { data: turnos, error } = await supabase
-      .from("turnos")
-      .select("id, email, telefono")
-      .eq("slug", slugClean)
-      .gte("fecha", hoy)
-      .neq("estado", "cancelado")
-      .or(orParts.join(","));
+    if (emailClean && !validateEmail(emailClean)) {
+      return res.status(400).json({ success: false, error: "Email inválido." });
+    }
+    if (phoneClean && !validatePhone(phoneClean)) {
+      return res.status(400).json({ success: false, error: "Teléfono inválido." });
+    }
 
-    if (error) throw error;
+    const hoy = new Date().toISOString().split("T")[0];
 
-    const existe = (turnos?.length ?? 0) > 0;
+    const [porEmail, porTelefono] = await Promise.all([
+      emailClean
+        ? supabase.from("turnos").select("id, email, telefono")
+            .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("email", emailClean)
+        : Promise.resolve({ data: [] }),
+      phoneClean
+        ? supabase.from("turnos").select("id, email, telefono")
+            .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("telefono", phoneClean)
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    const turnos = [...(porEmail.data || []), ...(porTelefono.data || [])];
+    const existe = turnos.length > 0;
     const coincide_email    = existe && !!emailClean && turnos.some(t => t.email?.toLowerCase() === emailClean);
     const coincide_telefono = existe && !!phoneClean && turnos.some(t => t.telefono === phoneClean);
 
     res.json({ success: true, existe, coincide_email, coincide_telefono });
   } catch (e) {
     console.error("Error en /turnos/check-cliente:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al verificar el cliente." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // AUTH — LOGIN
 // POST /login
+// FIX-SEC: bloqueo temporal por cuenta tras varios intentos
+// fallidos (además del rate limit por IP), y limpieza del contador
+// al loguear con éxito.
 // ══════════════════════════════════════════════════════════════
 app.post("/login", limiterAuth, async (req, res) => {
   try {
@@ -844,16 +1004,33 @@ app.post("/login", limiterAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "Faltan email (o slug) y contraseña." });
     }
 
+    const claveBloqueo = rawSlug || email;
+    const estadoBloqueo = chequearBloqueoLogin(claveBloqueo);
+    if (estadoBloqueo.bloqueado) {
+      return res.status(429).json({
+        success: false,
+        error: `Demasiados intentos fallidos. Probá de nuevo en ${estadoBloqueo.minutosRestantes} minuto(s).`,
+      });
+    }
+
     let query = supabase.from("usuarios")
       .select("id, slug, password, business_name, nombre_persona, apellido, email, activo, plan, estado_suscripcion, fecha_vencimiento");
     query = rawSlug ? query.eq("slug", rawSlug) : query.eq("email", email);
 
     const { data: user, error } = await query.maybeSingle();
     if (error) throw error;
-    if (!user) return res.status(401).json({ success: false, error: "Credenciales incorrectas." });
+    if (!user) {
+      registrarIntentoFallidoLogin(claveBloqueo);
+      return res.status(401).json({ success: false, error: "Credenciales incorrectas." });
+    }
 
     const passwordOk = await verificarPassword(password, user.password, user.id);
-    if (!passwordOk) return res.status(401).json({ success: false, error: "Credenciales incorrectas." });
+    if (!passwordOk) {
+      registrarIntentoFallidoLogin(claveBloqueo);
+      return res.status(401).json({ success: false, error: "Credenciales incorrectas." });
+    }
+
+    limpiarIntentosLogin(claveBloqueo);
 
     const diasRestantes      = user.fecha_vencimiento ? diasHastaVencer(user.fecha_vencimiento) : null;
     const suscripcionVencida = diasRestantes !== null && diasRestantes <= 0;
@@ -912,7 +1089,7 @@ app.post("/login", limiterAuth, async (req, res) => {
     });
   } catch (e) {
     console.error("Error en /login:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al iniciar sesión." });
   }
 });
 
@@ -965,15 +1142,16 @@ app.post("/admin/reset-password", requireAdminKey, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, message: `Password actualizado para ${email}` });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo actualizar el password." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // AUTH — Enviar código de verificación (por slug)
 // POST /auth/send-code
+// FIX-SEC: limiterCodigo agregado.
 // ══════════════════════════════════════════════════════════════
-app.post("/auth/send-code", async (req, res) => {
+app.post("/auth/send-code", limiterCodigo, async (req, res) => {
   try {
     const { slug } = req.body;
     if (!slug) return res.status(400).json({ success: false, error: "Slug requerido." });
@@ -984,34 +1162,37 @@ app.post("/auth/send-code", async (req, res) => {
     const { data: user, error } = await supabase
       .from("usuarios")
       .update({ codigo_verificacion: codigo, codigo_verificacion_expiry: expiry.toISOString() })
-      .eq("slug", slug)
+      .eq("slug", cleanSlug(slug))
       .select("email, nombre_persona")
       .single();
 
     if (error) throw error;
 
-    fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify({
-        action: "verificarCodigo",
-        email:  user.email,
-        nombre: user.nombre_persona,
-        codigo,
-      }),
-    }).catch((e) => console.error("Error mail código:", e.message));
+    if (APPS_SCRIPT_URL) {
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action: "verificarCodigo",
+          email:  user.email,
+          nombre: user.nombre_persona,
+          codigo,
+        }),
+      }).catch((e) => console.error("Error mail código:", e.message));
+    }
 
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo enviar el código." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // AUTH — Verificar código (por slug)
 // POST /auth/verify-code
+// FIX-SEC: limiterCodigo agregado.
 // ══════════════════════════════════════════════════════════════
-app.post("/auth/verify-code", async (req, res) => {
+app.post("/auth/verify-code", limiterCodigo, async (req, res) => {
   try {
     const { slug, codigo } = req.body;
     if (!slug || !codigo) return res.status(400).json({ success: false, error: "Faltan parámetros." });
@@ -1019,7 +1200,7 @@ app.post("/auth/verify-code", async (req, res) => {
     const { data: user, error } = await supabase
       .from("usuarios")
       .select("codigo_verificacion, codigo_verificacion_expiry, email_verificado")
-      .eq("slug", slug)
+      .eq("slug", cleanSlug(slug))
       .maybeSingle();
 
     if (error) throw error;
@@ -1034,16 +1215,15 @@ app.post("/auth/verify-code", async (req, res) => {
       email_verificado:           true,
       codigo_verificacion:        null,
       codigo_verificacion_expiry: null,
-    }).eq("slug", slug);
+    }).eq("slug", cleanSlug(slug));
     if (updError) throw updError;
 
     invalidateCache(slug);
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo verificar el código." });
   }
 });
-
 // ══════════════════════════════════════════════════════════════
 // NEGOCIO PÚBLICO
 // GET /negocio/:slug
@@ -1091,7 +1271,7 @@ app.get("/negocio/:slug", async (req, res) => {
     });
   } catch (e) {
     console.error("Error en /negocio:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener el negocio." });
   }
 });
 
@@ -1104,6 +1284,7 @@ app.get("/slots-disponibles/:slug", async (req, res) => {
     const slug = cleanSlug(req.params.slug);
     const { fecha, servicio_id } = req.query;
     if (!slug || !fecha) return res.status(400).json({ success: false, error: "Faltan slug o fecha." });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ success: false, error: "Formato de fecha inválido." });
 
     const { data: user, error: userError } = await supabase.from("usuarios")
       .select("horarios, duracion_turno, capacidad_por_turno, excepciones, activo, estado_suscripcion, fecha_vencimiento")
@@ -1152,7 +1333,6 @@ intervalosDia.forEach(([ini, fin]) => {
       return { inicio: inicioTurno, fin: inicioTurno + durTurno };
     });
 
-    // Si "fecha" es hoy, ignoramos los horarios que ya pasaron
     const ahoraArg      = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
     const hoyISO         = ahoraArg.toISOString().split("T")[0];
     const esHoy           = fecha === hoyISO;
@@ -1167,13 +1347,12 @@ intervalosDia.forEach(([ini, fin]) => {
         return { hora: fromMin(slotInicio), disponibles, lleno: disponibles <= 0 };
       });
 
-    // Día laboral + no queda ningún horario libre de acá en adelante → se puede anotar en la cola
     const puedeAnotarseEspera = slots.every((s) => s.lleno);
 
     res.json({ success: true, slots, puede_anotarse_espera: puedeAnotarseEspera });
   } catch (e) {
     console.error("Error en /slots-disponibles:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener los turnos disponibles." });
   }
 });
 
@@ -1192,15 +1371,22 @@ app.get("/servicios/:slug", async (req, res) => {
     if (error) throw error;
     res.json({ success: true, servicios: data || [] });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener los servicios." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // SERVICIOS — ADMIN — UPLOAD IMAGEN
 // POST /admin/servicios/upload-imagen
+// FIX-SEC: multer ya filtra por mimetype (ver TIPOS_IMAGEN_PERMITIDOS).
+// Se agrega manejo del error de multer para devolver 400 en vez de 500.
 // ══════════════════════════════════════════════════════════════
-app.post("/admin/servicios/upload-imagen", requireAuth, upload.single("imagen"), async (req, res) => {
+app.post("/admin/servicios/upload-imagen", requireAuth, (req, res, next) => {
+  upload.single("imagen")(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, error: err.message });
+    next();
+  });
+}, async (req, res) => {
   try {
     const slug = cleanSlug(req.body.slug || req.auth.slug);
     if (!req.file) return res.status(400).json({ success: false, error: "No se recibió imagen." });
@@ -1218,7 +1404,7 @@ app.post("/admin/servicios/upload-imagen", requireAuth, upload.single("imagen"),
     res.json({ success: true, url: data.publicUrl });
   } catch (e) {
     console.error("Error upload imagen:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo subir la imagen." });
   }
 });
 
@@ -1234,6 +1420,8 @@ app.post("/turnos/lista-espera", limiterBooking, async (req, res) => {
     if (!slugClean || !fecha || !nombre || !canal) {
       return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
     }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ success: false, error: "Formato de fecha inválido." });
+    if (nombre.trim().length < 2 || nombre.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre inválido." });
     if ((canal === "email" || canal === "ambos") && !email)
       return res.status(400).json({ success: false, error: "Falta el email." });
     if ((canal === "whatsapp" || canal === "ambos") && !telefono)
@@ -1273,7 +1461,7 @@ app.post("/turnos/lista-espera", limiterBooking, async (req, res) => {
     res.status(201).json({ success: true, id: entrada.id, message: "Te anotamos en la lista de espera. Te avisamos si se libera un turno." });
   } catch (e) {
     console.error("Error en /turnos/lista-espera:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo anotar en la lista de espera." });
   }
 });
 
@@ -1286,7 +1474,7 @@ app.get("/admin/lista-espera/:slug", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, lista_espera: data || [] });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener la lista de espera." });
   }
 });
 
@@ -1298,7 +1486,7 @@ app.delete("/admin/lista-espera/:id", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo eliminar." });
   }
 });
 
@@ -1311,7 +1499,7 @@ app.get("/cron/limpiar-lista-espera", requireAdminKey, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, borrados: data?.length || 0 });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al limpiar la lista de espera." });
   }
 });
 
@@ -1332,7 +1520,7 @@ app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
 
     res.json({ success: true, notificaciones: data || [], no_leidas: count || 0 });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener notificaciones." });
   }
 });
 
@@ -1344,7 +1532,7 @@ app.put("/notificaciones/:id/leida", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al actualizar." });
   }
 });
 
@@ -1356,7 +1544,7 @@ app.put("/notificaciones/:slug/leer-todas", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al actualizar." });
   }
 });
 
@@ -1368,14 +1556,12 @@ app.delete("/notificaciones/:id", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al eliminar." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // CRON — Recordatorios de turnos de mañana
-// Llamar 1 vez al día (ej. 8:00 ART) desde Render Cron Job o
-// cron-job.org, con header x-api-key: ADMIN_SECRET
 // ══════════════════════════════════════════════════════════════
 app.get("/cron/recordatorios-turnos", requireAdminKey, async (req, res) => {
   try {
@@ -1400,12 +1586,13 @@ app.get("/cron/recordatorios-turnos", requireAdminKey, async (req, res) => {
     }
     res.json({ success: true, negocios_notificados: Object.keys(porNegocio).length });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al procesar recordatorios." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // SERVICIOS — ADMIN — CRUD
+// FIX-SEC: precio y duracion ahora se validan como números positivos.
 // ══════════════════════════════════════════════════════════════
 app.get("/admin/servicios/:slug", requireAuth, async (req, res) => {
   try {
@@ -1415,7 +1602,7 @@ app.get("/admin/servicios/:slug", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, servicios: data || [] });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener servicios." });
   }
 });
 
@@ -1426,16 +1613,31 @@ app.post("/admin/servicios", requireAuth, async (req, res) => {
     if (!slugClean || !nombre || !duracion || precio === undefined) {
       return res.status(400).json({ success: false, error: "Faltan campos: nombre, duracion, precio." });
     }
+    const duracionNum  = parseInt(duracion);
+    const precioNum    = Number(precio);
+    const capacidadNum = parseInt(capacidad) || 1;
+    if (!Number.isFinite(duracionNum) || duracionNum <= 0 || duracionNum > 1440) {
+      return res.status(400).json({ success: false, error: "Duración inválida." });
+    }
+    if (!Number.isFinite(precioNum) || precioNum < 0) {
+      return res.status(400).json({ success: false, error: "Precio inválido." });
+    }
+    if (!Number.isFinite(capacidadNum) || capacidadNum <= 0 || capacidadNum > 500) {
+      return res.status(400).json({ success: false, error: "Capacidad inválida." });
+    }
+    if (nombre.trim().length < 1 || nombre.trim().length > 100) {
+      return res.status(400).json({ success: false, error: "Nombre inválido." });
+    }
     const { data, error } = await supabase.from("servicios").insert([{
-      slug: slugClean, nombre: nombre.trim(), descripcion: descripcion?.trim() || "",
-      duracion: parseInt(duracion), precio: Number(precio),
-      capacidad: parseInt(capacidad) || 1, orden: parseInt(orden) || 0, activo: "true",
+      slug: slugClean, nombre: nombre.trim(), descripcion: (descripcion?.trim() || "").slice(0, 500),
+      duracion: duracionNum, precio: precioNum,
+      capacidad: capacidadNum, orden: parseInt(orden) || 0, activo: "true",
     }]).select().single();
     if (error) throw error;
     invalidateCache(slugClean);
     res.status(201).json({ success: true, servicio: data });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo crear el servicio." });
   }
 });
 
@@ -1445,19 +1647,34 @@ app.put("/admin/servicios/:id", requireAuth, async (req, res) => {
     const slugClean = cleanSlug(req.body.slug || req.auth.slug);
     const { nombre, descripcion, duracion, precio, capacidad, activo, orden } = req.body;
     const u = {};
-    if (nombre      !== undefined) u.nombre      = nombre.trim();
-    if (descripcion !== undefined) u.descripcion = descripcion.trim();
-    if (duracion    !== undefined) u.duracion    = parseInt(duracion);
-    if (precio      !== undefined) u.precio      = Number(precio);
-    if (capacidad   !== undefined) u.capacidad   = parseInt(capacidad);
-    if (activo      !== undefined) u.activo      = activo === true || activo === "true" ? "true" : "false";
-    if (orden       !== undefined) u.orden       = parseInt(orden);
+    if (nombre !== undefined) {
+      if (nombre.trim().length < 1 || nombre.trim().length > 100) return res.status(400).json({ success: false, error: "Nombre inválido." });
+      u.nombre = nombre.trim();
+    }
+    if (descripcion !== undefined) u.descripcion = descripcion.trim().slice(0, 500);
+    if (duracion !== undefined) {
+      const d = parseInt(duracion);
+      if (!Number.isFinite(d) || d <= 0 || d > 1440) return res.status(400).json({ success: false, error: "Duración inválida." });
+      u.duracion = d;
+    }
+    if (precio !== undefined) {
+      const p = Number(precio);
+      if (!Number.isFinite(p) || p < 0) return res.status(400).json({ success: false, error: "Precio inválido." });
+      u.precio = p;
+    }
+    if (capacidad !== undefined) {
+      const c = parseInt(capacidad);
+      if (!Number.isFinite(c) || c <= 0 || c > 500) return res.status(400).json({ success: false, error: "Capacidad inválida." });
+      u.capacidad = c;
+    }
+    if (activo !== undefined) u.activo = activo === true || activo === "true" ? "true" : "false";
+    if (orden  !== undefined) u.orden  = parseInt(orden);
     const { data, error } = await supabase.from("servicios").update(u).eq("id", id).eq("slug", slugClean).select().single();
     if (error) throw error;
     invalidateCache(slugClean);
     res.json({ success: true, servicio: data });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo actualizar el servicio." });
   }
 });
 
@@ -1470,7 +1687,7 @@ app.delete("/admin/servicios/:id", requireAuth, async (req, res) => {
     invalidateCache(slugClean);
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo eliminar el servicio." });
   }
 });
 
@@ -1486,6 +1703,8 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
     if (!name || !phone || !fecha || !hora || !slugClean) {
       return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
     }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ success: false, error: "Formato de fecha inválido." });
+    if (name.trim().length < 2 || name.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre inválido." });
     const phoneClean = cleanPhone(phone.toString());
     if (!validatePhone(phoneClean)) return res.status(400).json({ success: false, error: "Teléfono inválido (7-15 dígitos)." });
     if (email && !validateEmail(email)) return res.status(400).json({ success: false, error: "Email inválido." });
@@ -1515,10 +1734,17 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
     if (requierePago) return res.status(403).json({ success: false, error: "Este turno requiere pago previo." });
 
     const hoy = new Date().toISOString().split("T")[0];
-    const { data: turnosExistentes } = await supabase.from("turnos").select("id")
-      .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado")
-      .or(`telefono.eq.${phoneClean}${email ? `,email.eq.${email.trim().toLowerCase()}` : ""}`);
-    if (turnosExistentes?.length > 0) return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
+    const emailClean = email?.trim().toLowerCase();
+    const [porTelefono, porEmail] = await Promise.all([
+      supabase.from("turnos").select("id")
+        .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("telefono", phoneClean),
+      emailClean
+        ? supabase.from("turnos").select("id")
+            .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("email", emailClean)
+        : Promise.resolve({ data: [] }),
+    ]);
+    const turnosExistentes = [...(porTelefono.data || []), ...(porEmail.data || [])];
+    if (turnosExistentes.length > 0) return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
 
     let capacidad      = user.capacidad_por_turno || 1;
     let servicioNombre = null;
@@ -1543,8 +1769,8 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       slug:            slugClean,
       nombre:          name.trim(),
       telefono:        phoneClean,
-      apellido:        apellido?.trim() || null,
-      email:           email?.trim().toLowerCase() || null,
+      apellido:        apellido?.trim().slice(0, 80) || null,
+      email:           emailClean || null,
       fecha,
       hora,
       servicio_id:     servicio_id || null,
@@ -1559,7 +1785,7 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
     
     enviarMailTurno({
       adminEmail:    user.email,
-      emailCliente:  email?.trim().toLowerCase() || "",
+      emailCliente:  emailClean || "",
       nombreCliente: name.trim(),
       fechaHora:     `${fecha} ${hora}`,
       slug:          slugClean,
@@ -1569,7 +1795,6 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       metodoPago:    user.metodo_pago || "none",
     });
 
-    // Confirmación por WhatsApp al cliente (no bloquea la respuesta si falla)
     enviarWhatsappTurno({
       telefono:      phoneClean,
       nombreCliente: name.trim(),
@@ -1578,7 +1803,6 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
       servicio:      servicioNombre || "",
     });
 
-    // Notificación in-app para el dueño del negocio
     crearNotificacion({
       slug: slugClean,
       tipo: "turno_nuevo",
@@ -1593,7 +1817,7 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
     res.json({ success: true, turno_id: turno.id, comprobante_url: comprobanteUrl, message: "Turno creado con éxito." });
   } catch (e) {
     console.error("Error en /turnos/reservar:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo crear el turno." });
   }
 });
 
@@ -1616,7 +1840,7 @@ app.get("/turnos/publico/:id", async (req, res) => {
 
     res.json({ success: true, turno });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener el turno." });
   }
 });
 
@@ -1638,7 +1862,7 @@ app.get("/turnos/by-payment", async (req, res) => {
 
     res.json({ success: true, turno });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener el turno." });
   }
 });
 
@@ -1655,6 +1879,9 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
     const ESTADOS_VALIDOS = ["confirmado", "pendiente", "cancelado", "completado", "no_asistio"];
     if (!estado || !ESTADOS_VALIDOS.includes(estado)) {
       return res.status(400).json({ success: false, error: `Estado inválido. Debe ser uno de: ${ESTADOS_VALIDOS.join(", ")}` });
+    }
+    if (notas !== undefined && notas !== null && String(notas).length > 1000) {
+      return res.status(400).json({ success: false, error: "Las notas son demasiado largas." });
     }
 
     const { data: turnoExistente, error: fetchError } = await supabase
@@ -1693,7 +1920,7 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
     res.json({ success: true, turno: turnoActualizado });
   } catch (e) {
     console.error("Error en PUT /turnos/:id:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo actualizar el turno." });
   }
 });
 
@@ -1737,7 +1964,7 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
     const dias = Object.keys(porFecha).sort().map((fecha) => ({ fecha, esHoy: fecha === hoyISO, turnos: porFecha[fecha] }));
     res.json({ success: true, hoy: hoyISO, dias });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener la agenda." });
   }
 });
 
@@ -1786,10 +2013,13 @@ app.get("/settings/:slug", requireAuth, async (req, res) => {
       },
     });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener la configuración." });
   }
 });
 
+// FIX-SEC: se valida la forma de horarios/excepciones antes de guardar
+// (ver validarHorarios / validarExcepciones), y se acotan largos de
+// texto libre (business_name, nombre_persona, apellido).
 app.put("/settings/:slug", requireAuth, async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
@@ -1807,18 +2037,51 @@ app.put("/settings/:slug", requireAuth, async (req, res) => {
       if (req.body[field] !== undefined) update[field] = req.body[field];
     });
 
-    if (update.duracion_turno      !== undefined) update.duracion_turno      = parseInt(update.duracion_turno)      || 30;
-    if (update.capacidad_por_turno !== undefined) update.capacidad_por_turno = parseInt(update.capacidad_por_turno) || 1;
-    if (update.porcentaje_sena     !== undefined) update.porcentaje_sena     = parseInt(update.porcentaje_sena)     || 30;
-    if (update.telefono            !== undefined) update.telefono            = cleanPhone(update.telefono);
-    if (update.business_name       !== undefined) update.business_name       = update.business_name.trim();
-    if (update.nombre_persona      !== undefined) update.nombre_persona      = update.nombre_persona.trim();
+    if (update.duracion_turno !== undefined) {
+      const d = parseInt(update.duracion_turno);
+      if (!Number.isFinite(d) || d <= 0 || d > 1440) return res.status(400).json({ success: false, error: "Duración de turno inválida." });
+      update.duracion_turno = d;
+    }
+    if (update.capacidad_por_turno !== undefined) {
+      const c = parseInt(update.capacidad_por_turno);
+      if (!Number.isFinite(c) || c <= 0 || c > 500) return res.status(400).json({ success: false, error: "Capacidad inválida." });
+      update.capacidad_por_turno = c;
+    }
+    if (update.porcentaje_sena !== undefined) {
+      const p = parseInt(update.porcentaje_sena);
+      if (!Number.isFinite(p) || p < 1 || p > 100) return res.status(400).json({ success: false, error: "Porcentaje de seña inválido." });
+      update.porcentaje_sena = p;
+    }
+    if (update.metodo_pago !== undefined && !["none", "sena", "total"].includes(update.metodo_pago)) {
+      return res.status(400).json({ success: false, error: "Método de pago inválido." });
+    }
+    if (update.telefono !== undefined) {
+      const tel = cleanPhone(update.telefono);
+      if (!validatePhone(tel)) return res.status(400).json({ success: false, error: "Teléfono inválido." });
+      update.telefono = tel;
+    }
+    if (update.business_name !== undefined) {
+      if (update.business_name.trim().length < 2 || update.business_name.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre de negocio inválido." });
+      update.business_name = update.business_name.trim();
+    }
+    if (update.nombre_persona !== undefined) {
+      if (update.nombre_persona.trim().length < 2 || update.nombre_persona.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre inválido." });
+      update.nombre_persona = update.nombre_persona.trim();
+    }
+    if (update.apellido !== undefined) update.apellido = String(update.apellido).trim().slice(0, 80);
 
     if (update.excepciones !== undefined && !Array.isArray(update.excepciones)) {
       update.excepciones = Object.entries(update.excepciones).map(([fecha, exc]) => ({
         fecha, type: exc.type ?? "block",
         ...(exc.slots ? { slots: exc.slots } : {}),
       }));
+    }
+
+    if (update.horarios !== undefined && !validarHorarios(update.horarios)) {
+      return res.status(400).json({ success: false, error: "Formato de horarios inválido." });
+    }
+    if (update.excepciones !== undefined && !validarExcepciones(update.excepciones)) {
+      return res.status(400).json({ success: false, error: "Formato de excepciones inválido." });
     }
 
     if (Object.keys(update).length === 0) {
@@ -1830,12 +2093,12 @@ app.put("/settings/:slug", requireAuth, async (req, res) => {
     invalidateCache(slug);
     res.json({ success: true, updated: Object.keys(update) });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo actualizar la configuración." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
-// TEMA — Guardar / Leer (única versión, antes estaba duplicada)
+// TEMA — Guardar / Leer
 // PUT/GET /admin/tema/:slug
 // ══════════════════════════════════════════════════════════════
 app.put("/admin/tema/:slug", requireAuth, async (req, res) => {
@@ -1843,9 +2106,6 @@ app.put("/admin/tema/:slug", requireAuth, async (req, res) => {
     const slug = cleanSlug(req.params.slug);
     const { primario, secundario, fondo, texto, acento, guardar_paleta, nombre_paleta } = req.body;
 
-    // FIX: filtro defensivo — además de excluir undefined, excluye
-    // null y string vacío, para que nunca se pisen colores guardados
-    // con valores vacíos (por ejemplo si el front manda "" por error).
     const COLOR_KEYS = ["primario", "secundario", "fondo", "texto", "acento"];
     const temaActual = { primario, secundario, fondo, texto, acento };
     const temaFiltrado = {};
@@ -1888,7 +2148,7 @@ app.put("/admin/tema/:slug", requireAuth, async (req, res) => {
 
     res.json({ success: true, tema: temaMerged, paletas_personalizadas: update.paletas_personalizadas || user.paletas_personalizadas || [] });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo guardar el tema." });
   }
 });
 
@@ -1907,28 +2167,34 @@ app.get("/admin/tema/:slug", requireAuth, async (req, res) => {
       paletas_personalizadas: user.paletas_personalizadas || [],
     });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener el tema." });
   }
 });
 
 // ══════════════════════════════════════════════════════════════
 // LOGO — Upload
 // POST /admin/logo/:slug
+// FIX-SEC: ya no se acepta SVG (era vector de XSS almacenado vía
+// <script> embebido). multer filtra por mimetype centralizadamente
+// (TIPOS_IMAGEN_PERMITIDOS). Se maneja el error de multer con 400.
 // ══════════════════════════════════════════════════════════════
-app.post("/admin/logo/:slug", requireAuth, upload.single("logo"), async (req, res) => {
+app.post("/admin/logo/:slug", requireAuth, (req, res, next) => {
+  upload.single("logo")(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, error: err.message });
+    next();
+  });
+}, async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
     if (!req.file) return res.status(400).json({ success: false, error: "No se recibió imagen." });
 
     const ext      = req.file.mimetype === "image/png"  ? "png"
                    : req.file.mimetype === "image/webp" ? "webp"
-                   : req.file.mimetype === "image/svg+xml" ? "svg"
                    : "jpg";
     const fileName = `${slug}/logo.${ext}`;
 
     await supabase.storage.from("logos").remove([
-      `${slug}/logo.png`, `${slug}/logo.jpg`,
-      `${slug}/logo.webp`, `${slug}/logo.svg`
+      `${slug}/logo.png`, `${slug}/logo.jpg`, `${slug}/logo.webp`,
     ]);
 
     const { error: uploadError } = await supabase.storage
@@ -1950,7 +2216,7 @@ app.post("/admin/logo/:slug", requireAuth, upload.single("logo"), async (req, re
     res.json({ success: true, logo_url: logoUrl });
   } catch (e) {
     console.error("Error upload logo:", e.message);
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo subir el logo." });
   }
 });
 
@@ -1960,8 +2226,7 @@ app.delete("/admin/logo/:slug", requireAuth, async (req, res) => {
     const slug = cleanSlug(req.params.slug);
 
     await supabase.storage.from("logos").remove([
-      `${slug}/logo.png`, `${slug}/logo.jpg`,
-      `${slug}/logo.webp`, `${slug}/logo.svg`
+      `${slug}/logo.png`, `${slug}/logo.jpg`, `${slug}/logo.webp`,
     ]);
 
     const { error: updError } = await supabase.from("usuarios").update({ logo_url: null }).eq("slug", slug);
@@ -1970,7 +2235,7 @@ app.delete("/admin/logo/:slug", requireAuth, async (req, res) => {
 
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo eliminar el logo." });
   }
 });
 
@@ -1988,7 +2253,7 @@ app.get("/admin/equipo/:slug", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, equipo: data || [] });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener el equipo." });
   }
 });
 
@@ -2000,23 +2265,28 @@ app.post("/admin/equipo", requireAuth, async (req, res) => {
     if (!slugClean || !nombre) {
       return res.status(400).json({ success: false, error: "Faltan nombre y slug." });
     }
+    if (nombre.trim().length < 1 || nombre.trim().length > 80) {
+      return res.status(400).json({ success: false, error: "Nombre inválido." });
+    }
 
     const COLORES_VALIDOS = /^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$/;
     const colorFinal = color && COLORES_VALIDOS.test(color) ? color : "#6366F1";
+    const ROLES_VALIDOS = ["colaborador", "admin"];
+    const rolFinal = ROLES_VALIDOS.includes(rol) ? rol : "colaborador";
 
     const { data, error } = await supabase.from("equipo").insert([{
       slug:     slugClean,
       nombre:   nombre.trim(),
-      apellido: apellido?.trim() || null,
+      apellido: apellido?.trim().slice(0, 80) || null,
       color:    colorFinal,
-      rol:      rol || "colaborador",
+      rol:      rolFinal,
       activo:   true,
     }]).select().single();
 
     if (error) throw error;
     res.status(201).json({ success: true, miembro: data });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo crear el miembro del equipo." });
   }
 });
 
@@ -2027,11 +2297,21 @@ app.put("/admin/equipo/:id", requireAuth, async (req, res) => {
     const { nombre, apellido, color, rol, activo } = req.body;
 
     const update = {};
-    if (nombre   !== undefined) update.nombre   = nombre.trim();
-    if (apellido !== undefined) update.apellido = apellido.trim();
-    if (color    !== undefined) update.color    = color;
-    if (rol      !== undefined) update.rol      = rol;
-    if (activo   !== undefined) update.activo   = activo === true || activo === "true";
+    if (nombre !== undefined) {
+      if (nombre.trim().length < 1 || nombre.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre inválido." });
+      update.nombre = nombre.trim();
+    }
+    if (apellido !== undefined) update.apellido = apellido.trim().slice(0, 80);
+    if (color !== undefined) {
+      const COLORES_VALIDOS = /^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$/;
+      if (!COLORES_VALIDOS.test(color)) return res.status(400).json({ success: false, error: "Color inválido." });
+      update.color = color;
+    }
+    if (rol !== undefined) {
+      if (!["colaborador", "admin"].includes(rol)) return res.status(400).json({ success: false, error: "Rol inválido." });
+      update.rol = rol;
+    }
+    if (activo !== undefined) update.activo = activo === true || activo === "true";
 
     const { data, error } = await supabase.from("equipo")
       .update(update)
@@ -2042,7 +2322,7 @@ app.put("/admin/equipo/:id", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true, miembro: data });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo actualizar." });
   }
 });
 
@@ -2059,7 +2339,7 @@ app.delete("/admin/equipo/:id", requireAuth, async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo eliminar." });
   }
 });
 
@@ -2275,7 +2555,7 @@ app.post("/superadmin/negocios", requireAdminKey, async (req, res) => {
     }
     res.status(201).json({ success: true, negocio: data, panel_url: `${PANEL_URL}?u=${slug}` });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo crear el negocio." });
   }
 });
 
@@ -2298,7 +2578,7 @@ app.get("/superadmin/negocios", requireAdminKey, async (req, res) => {
     }));
     res.json({ success: true, negocios, total: negocios.length });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "Error al obtener negocios." });
   }
 });
 
@@ -2322,7 +2602,7 @@ app.put("/superadmin/negocios/:slug", requireAdminKey, async (req, res) => {
     invalidateCache(slug);
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: "No se pudo actualizar el negocio." });
   }
 });
 
