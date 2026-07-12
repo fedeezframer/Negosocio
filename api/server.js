@@ -1534,194 +1534,6 @@ app.get("/cron/limpiar-lista-espera", requireAdminKey, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// NOTIFICACIONES
-// ══════════════════════════════════════════════════════════════
-app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
-  try {
-    const slug = cleanSlug(req.params.slug);
-    let query = supabase.from("notificaciones").select("*").eq("slug", slug)
-      .order("created_at", { ascending: false }).limit(50);
-    if (req.query.no_leidas === "true") query = query.eq("leida", false);
-    const { data, error } = await query;
-    if (error) throw error;
-
-    const { count } = await supabase.from("notificaciones").select("id", { count: "exact", head: true })
-      .eq("slug", slug).eq("leida", false);
-
-    res.json({ success: true, notificaciones: data || [], no_leidas: count || 0 });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "Error al obtener notificaciones." });
-  }
-});
-
-app.put("/notificaciones/:id/leida", requireAuth, async (req, res) => {
-  try {
-    const slugClean = cleanSlug(req.body?.slug || req.auth.slug);
-    const { error } = await supabase.from("notificaciones")
-      .update({ leida: true }).eq("id", req.params.id).eq("slug", slugClean);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "Error al actualizar." });
-  }
-});
-
-app.put("/notificaciones/:slug/leer-todas", requireAuth, async (req, res) => {
-  try {
-    const slug = cleanSlug(req.params.slug);
-    const { error } = await supabase.from("notificaciones")
-      .update({ leida: true }).eq("slug", slug).eq("leida", false);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "Error al actualizar." });
-  }
-});
-
-app.delete("/notificaciones/:id", requireAuth, async (req, res) => {
-  try {
-    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
-    const { error } = await supabase.from("notificaciones")
-      .delete().eq("id", req.params.id).eq("slug", slugClean);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "Error al eliminar." });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════
-// CRON — Recordatorios de turnos de mañana
-// ══════════════════════════════════════════════════════════════
-app.get("/cron/recordatorios-turnos", requireAdminKey, async (req, res) => {
-  try {
-    const ahoraArg = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" }));
-    const manana = new Date(ahoraArg); manana.setDate(manana.getDate() + 1);
-    const mananaISO = manana.toISOString().split("T")[0];
-
-    const { data: turnos, error } = await supabase.from("turnos")
-      .select("slug, nombre, hora").eq("fecha", mananaISO).neq("estado", "cancelado")
-      .order("hora", { ascending: true });
-    if (error) throw error;
-
-    const porNegocio = {};
-    (turnos || []).forEach((t) => { (porNegocio[t.slug] ||= []).push(t); });
-
-    for (const [slug, lista] of Object.entries(porNegocio)) {
-      await crearNotificacion({
-        slug, tipo: "recordatorio", titulo: `Tenés ${lista.length} turno(s) mañana`,
-        mensaje: lista.slice(0, 3).map(t => `${t.hora.slice(0,5)} - ${t.nombre}`).join(" · ") + (lista.length > 3 ? "…" : ""),
-        data: { fecha: mananaISO, cantidad: lista.length },
-      });
-    }
-    res.json({ success: true, negocios_notificados: Object.keys(porNegocio).length });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "Error al procesar recordatorios." });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════
-// SERVICIOS — ADMIN — CRUD
-// FIX-SEC: precio y duracion ahora se validan como números positivos.
-// ══════════════════════════════════════════════════════════════
-app.get("/admin/servicios/:slug", requireAuth, async (req, res) => {
-  try {
-    const slug = cleanSlug(req.params.slug);
-    const { data, error } = await supabase.from("servicios").select("*").eq("slug", slug)
-      .order("orden", { ascending: true }).order("created_at", { ascending: true });
-    if (error) throw error;
-    res.json({ success: true, servicios: data || [] });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "Error al obtener servicios." });
-  }
-});
-
-app.post("/admin/servicios", requireAuth, async (req, res) => {
-  try {
-    const { slug, nombre, descripcion, duracion, precio, capacidad, orden } = req.body;
-    const slugClean = cleanSlug(slug || req.auth.slug);
-    if (!slugClean || !nombre || !duracion || precio === undefined) {
-      return res.status(400).json({ success: false, error: "Faltan campos: nombre, duracion, precio." });
-    }
-    const duracionNum  = parseInt(duracion);
-    const precioNum    = Number(precio);
-    const capacidadNum = parseInt(capacidad) || 1;
-    if (!Number.isFinite(duracionNum) || duracionNum <= 0 || duracionNum > 1440) {
-      return res.status(400).json({ success: false, error: "Duración inválida." });
-    }
-    if (!Number.isFinite(precioNum) || precioNum < 0) {
-      return res.status(400).json({ success: false, error: "Precio inválido." });
-    }
-    if (!Number.isFinite(capacidadNum) || capacidadNum <= 0 || capacidadNum > 500) {
-      return res.status(400).json({ success: false, error: "Capacidad inválida." });
-    }
-    if (nombre.trim().length < 1 || nombre.trim().length > 100) {
-      return res.status(400).json({ success: false, error: "Nombre inválido." });
-    }
-    const { data, error } = await supabase.from("servicios").insert([{
-      slug: slugClean, nombre: nombre.trim(), descripcion: (descripcion?.trim() || "").slice(0, 500),
-      duracion: duracionNum, precio: precioNum,
-      capacidad: capacidadNum, orden: parseInt(orden) || 0, activo: "true",
-    }]).select().single();
-    if (error) throw error;
-    invalidateCache(slugClean);
-    res.status(201).json({ success: true, servicio: data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "No se pudo crear el servicio." });
-  }
-});
-
-app.put("/admin/servicios/:id", requireAuth, async (req, res) => {
-  try {
-    const { id }    = req.params;
-    const slugClean = cleanSlug(req.body.slug || req.auth.slug);
-    const { nombre, descripcion, duracion, precio, capacidad, activo, orden } = req.body;
-    const u = {};
-    if (nombre !== undefined) {
-      if (nombre.trim().length < 1 || nombre.trim().length > 100) return res.status(400).json({ success: false, error: "Nombre inválido." });
-      u.nombre = nombre.trim();
-    }
-    if (descripcion !== undefined) u.descripcion = descripcion.trim().slice(0, 500);
-    if (duracion !== undefined) {
-      const d = parseInt(duracion);
-      if (!Number.isFinite(d) || d <= 0 || d > 1440) return res.status(400).json({ success: false, error: "Duración inválida." });
-      u.duracion = d;
-    }
-    if (precio !== undefined) {
-      const p = Number(precio);
-      if (!Number.isFinite(p) || p < 0) return res.status(400).json({ success: false, error: "Precio inválido." });
-      u.precio = p;
-    }
-    if (capacidad !== undefined) {
-      const c = parseInt(capacidad);
-      if (!Number.isFinite(c) || c <= 0 || c > 500) return res.status(400).json({ success: false, error: "Capacidad inválida." });
-      u.capacidad = c;
-    }
-    if (activo !== undefined) u.activo = activo === true || activo === "true" ? "true" : "false";
-    if (orden  !== undefined) u.orden  = parseInt(orden);
-    const { data, error } = await supabase.from("servicios").update(u).eq("id", id).eq("slug", slugClean).select().single();
-    if (error) throw error;
-    invalidateCache(slugClean);
-    res.json({ success: true, servicio: data });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "No se pudo actualizar el servicio." });
-  }
-});
-
-app.delete("/admin/servicios/:id", requireAuth, async (req, res) => {
-  try {
-    const { id }    = req.params;
-    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
-    const { error } = await supabase.from("servicios").delete().eq("id", id).eq("slug", slugClean);
-    if (error) throw error;
-    invalidateCache(slugClean);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: "No se pudo eliminar el servicio." });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════
 // TURNOS — RESERVA PÚBLICA (sin pago)
 // POST /turnos/reservar
 // ══════════════════════════════════════════════════════════════
@@ -1852,6 +1664,147 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+// TURNOS — RESERVA MANUAL (transferencia / efectivo, solo premium)
+// POST /turnos/reservar-manual
+// Siempre queda estado = "pendiente" hasta que el vendedor la
+// apruebe o rechace desde el panel.
+// ══════════════════════════════════════════════════════════════
+app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
+  upload.single("comprobante")(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, error: err.message });
+    next();
+  });
+}, async (req, res) => {
+  try {
+    const { name, apellido, phone, email, fecha, hora, slug, servicio_id, metodo_pago } = req.body;
+    const slugClean = cleanSlug(slug || "");
+
+    if (!name || !phone || !fecha || !hora || !slugClean || !metodo_pago) {
+      return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
+    }
+    if (!["transferencia", "efectivo"].includes(metodo_pago)) {
+      return res.status(400).json({ success: false, error: "Método de pago inválido." });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ success: false, error: "Formato de fecha inválido." });
+    if (name.trim().length < 2 || name.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre inválido." });
+
+    const phoneClean = cleanPhone(phone.toString());
+    if (!validatePhone(phoneClean)) return res.status(400).json({ success: false, error: "Teléfono inválido (7-15 dígitos)." });
+    if (email && !validateEmail(email)) return res.status(400).json({ success: false, error: "Email inválido." });
+
+    if (metodo_pago === "transferencia" && !req.file) {
+      return res.status(400).json({ success: false, error: "Adjuntá el comprobante de la transferencia." });
+    }
+
+    const { data: user, error: userError } = await supabase.from("usuarios").select("*").eq("slug", slugClean).maybeSingle();
+    if (userError) throw userError;
+    if (!user) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+    if (!isActivo(user.activo)) return res.status(404).json({ success: false, error: "Negocio no disponible." });
+
+    const diasRestantes  = user.fecha_vencimiento ? diasHastaVencer(user.fecha_vencimiento) : null;
+    const estaSuspendido = user.estado_suscripcion === "suspendido" || (diasRestantes !== null && diasRestantes <= 0);
+    if (estaSuspendido) return res.status(403).json({ success: false, error: "Este servicio está pausado temporalmente." });
+
+    // FIX-SEC: transferencia/efectivo son exclusivos de premium. Se
+    // revalida acá (no solo confiar en lo que muestra el front) por
+    // si el negocio bajó de plan después de haber tenido esto activo.
+    if (user.plan !== "premium") {
+      return res.status(403).json({ success: false, error: "Este negocio no ofrece este método de pago." });
+    }
+    if (metodo_pago === "transferencia" && !user.acepta_transferencia) {
+      return res.status(403).json({ success: false, error: "Este negocio no acepta pagos por transferencia." });
+    }
+    if (metodo_pago === "efectivo" && !user.acepta_efectivo) {
+      return res.status(403).json({ success: false, error: "Este negocio no acepta pagos en efectivo." });
+    }
+
+    const hoy = new Date().toISOString().split("T")[0];
+    const emailClean = email?.trim().toLowerCase();
+    const [porTelefono, porEmail] = await Promise.all([
+      supabase.from("turnos").select("id")
+        .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("telefono", phoneClean),
+      emailClean
+        ? supabase.from("turnos").select("id")
+            .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("email", emailClean)
+        : Promise.resolve({ data: [] }),
+    ]);
+    if ([...(porTelefono.data || []), ...(porEmail.data || [])].length > 0) {
+      return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
+    }
+
+    let capacidad      = user.capacidad_por_turno || 1;
+    let servicioNombre = null;
+    let precioCobrado  = 0;
+    if (servicio_id) {
+      const { data: srv } = await supabase.from("servicios").select("nombre, capacidad, precio").eq("id", servicio_id).maybeSingle();
+      if (srv) { servicioNombre = srv.nombre; capacidad = srv.capacidad || capacidad; precioCobrado = Number(srv.precio || 0); }
+    }
+
+    const { count } = await supabase.from("turnos").select("id", { count: "exact" })
+      .eq("slug", slugClean).eq("fecha", fecha).eq("hora", hora).neq("estado", "cancelado");
+    if (count >= capacidad) return res.status(400).json({ success: false, error: "Este turno ya está lleno." });
+
+    let comprobantePath = null;
+    if (metodo_pago === "transferencia") {
+      const ext = req.file.mimetype === "image/png" ? "png" : req.file.mimetype === "image/webp" ? "webp" : "jpg";
+      comprobantePath = `${slugClean}/${Date.now()}-${crypto.randomUUID()}.${ext}`;
+      const { error: upErr } = await supabase.storage.from("comprobantes")
+        .upload(comprobantePath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+      if (upErr) throw upErr;
+    }
+
+    const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
+      slug: slugClean, nombre: name.trim(), apellido: apellido?.trim().slice(0, 80) || null,
+      telefono: phoneClean, email: emailClean || null, fecha, hora,
+      servicio_id: servicio_id || null, servicio_nombre: servicioNombre,
+      precio_cobrado: precioCobrado, monto_pagado: 0,
+      estado: "pendiente", metodo_pago,
+      pago_estado: metodo_pago === "transferencia" ? "pendiente" : "sin_pago",
+      comprobante_path: comprobantePath,
+    }]).select().single();
+    if (turnoError) throw turnoError;
+
+    // Mail al vendedor avisando que hay un turno para aprobar.
+    if (APPS_SCRIPT_URL) {
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST", headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action:      "turnoPendienteAprobacion",
+          adminEmail:  user.email,
+          nombreCliente: name.trim(),
+          fechaHora:   `${fecha} ${hora}`,
+          slug:        slugClean,
+          servicio:    servicioNombre || "",
+          metodoPago:  metodo_pago,
+          precioTotal: precioCobrado,
+          panelUrl:    `${PANEL_URL}?u=${slugClean}`,
+        }),
+      }).catch((e) => console.error("Error mail turno pendiente:", e.message));
+    }
+
+    crearNotificacion({
+      slug: slugClean,
+      tipo: "turno_pendiente",
+      titulo: `Nuevo turno pendiente (${metodo_pago})`,
+      mensaje: `${name.trim()} reservó ${servicioNombre ? servicioNombre + " " : ""}para el ${fecha} a las ${hora}hs y espera tu aprobación (${metodo_pago}).`,
+      data: { turno_id: turno.id, fecha, hora, metodo_pago },
+    });
+
+    invalidateCache(slugClean);
+
+    res.status(201).json({
+      success: true,
+      turno_id: turno.id,
+      estado: "pendiente",
+      message: "Tu reserva quedó pendiente de aprobación. Te avisamos apenas el negocio la confirme.",
+    });
+  } catch (e) {
+    console.error("Error en /turnos/reservar-manual:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo crear la reserva." });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
 // TURNOS — COMPROBANTE PÚBLICO
 // GET /turnos/publico/:id
 // ══════════════════════════════════════════════════════════════
@@ -1897,8 +1850,53 @@ app.get("/turnos/by-payment", async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+// TURNOS — PENDIENTES DE APROBACIÓN (transferencia / efectivo)
+// GET /admin/turnos-pendientes/:slug
+// ══════════════════════════════════════════════════════════════
+app.get("/admin/turnos-pendientes/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { data, error } = await supabase.from("turnos")
+      .select("id, nombre, apellido, telefono, email, fecha, hora, servicio_nombre, precio_cobrado, metodo_pago, pago_estado, comprobante_path, created_at")
+      .eq("slug", slug).eq("estado", "pendiente").in("metodo_pago", ["transferencia", "efectivo"])
+      .order("fecha", { ascending: true }).order("hora", { ascending: true });
+    if (error) throw error;
+
+    const turnos = (data || []).map((t) => ({ ...t, tiene_comprobante: !!t.comprobante_path }));
+    res.json({ success: true, turnos_pendientes: turnos });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Error al obtener los turnos pendientes." });
+  }
+});
+
+// Signed URL de corta duración — el comprobante NUNCA se sirve como
+// URL pública porque puede tener CBU/alias/nombre del titular.
+// GET /admin/turnos/:id/comprobante
+app.get("/admin/turnos/:id/comprobante", requireAuth, async (req, res) => {
+  try {
+    const slugClean = cleanSlug(req.query.slug || req.auth.slug);
+    const { data: turno, error } = await supabase.from("turnos")
+      .select("comprobante_path").eq("id", req.params.id).eq("slug", slugClean).maybeSingle();
+    if (error) throw error;
+    if (!turno?.comprobante_path) return res.status(404).json({ success: false, error: "No hay comprobante para este turno." });
+
+    const { data: signed, error: signError } = await supabase.storage
+      .from("comprobantes").createSignedUrl(turno.comprobante_path, 60 * 10); // 10 minutos
+    if (signError) throw signError;
+
+    res.json({ success: true, url: signed.signedUrl });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo obtener el comprobante." });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
 // TURNOS — ACTUALIZAR ESTADO (admin)
 // PUT /turnos/:id
+// Incluye el efecto de "aprobar" un turno pendiente por
+// transferencia/efectivo: pasa el pago a aprobado y avisa al
+// cliente por mail + WhatsApp. Rechazar sigue el flujo normal:
+// estado="cancelado", libera cupo y avisa a la lista de espera.
 // ══════════════════════════════════════════════════════════════
 app.put("/turnos/:id", requireAuth, async (req, res) => {
   try {
@@ -1915,14 +1913,26 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
     }
 
     const { data: turnoExistente, error: fetchError } = await supabase
-      .from("turnos").select("id, slug, estado, fecha, hora, nombre")
+      .from("turnos")
+      .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, metodo_pago, pago_estado, precio_cobrado")
       .eq("id", id).eq("slug", slugClean).maybeSingle();
 
     if (fetchError) throw fetchError;
     if (!turnoExistente) return res.status(404).json({ success: false, error: "Turno no encontrado." });
 
+    // Aprobación de un turno manual (transferencia/efectivo) pendiente
+    const esAprobacionManual =
+      estado === "confirmado" &&
+      turnoExistente.estado === "pendiente" &&
+      ["transferencia", "efectivo"].includes(turnoExistente.metodo_pago);
+
     const updateData = { estado };
     if (notas !== undefined) updateData.notas = notas;
+    if (esAprobacionManual && turnoExistente.metodo_pago === "transferencia") {
+      updateData.pago_estado  = "aprobado";
+      updateData.monto_pagado = turnoExistente.precio_cobrado || 0;
+      updateData.fecha_pago   = new Date().toISOString();
+    }
 
     const { data: turnoActualizado, error: updateError } = await supabase
       .from("turnos").update(updateData).eq("id", id).eq("slug", slugClean).select().single();
@@ -1942,6 +1952,35 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
         titulo: "Turno cancelado",
         mensaje: `Se canceló el turno de ${turnoExistente.nombre || "un cliente"} del ${turnoExistente.fecha} a las ${turnoExistente.hora?.slice(0, 5) || ""}hs.`,
         data: { turno_id: id, fecha: turnoExistente.fecha },
+      });
+    }
+
+    // Avisar al cliente que su turno (transferencia/efectivo) fue aprobado.
+    if (esAprobacionManual) {
+      if (turnoExistente.email && APPS_SCRIPT_URL) {
+        fetch(APPS_SCRIPT_URL, {
+          method: "POST", headers: { "Content-Type": "text/plain" },
+          body: JSON.stringify({
+            action:        "newAppointmentEmailCliente",
+            nombreCliente: turnoExistente.nombre,
+            fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
+            emailCliente:  turnoExistente.email,
+            slug:          slugClean,
+            servicio:      turnoExistente.servicio_nombre || "",
+            precioTotal:   turnoExistente.precio_cobrado || 0,
+            montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
+            metodoPago:    turnoExistente.metodo_pago,
+          }),
+        }).catch((e) => console.error("Error mail aprobación turno:", e.message));
+      }
+
+      const { data: negocio } = await supabase.from("usuarios").select("business_name").eq("slug", slugClean).maybeSingle();
+      enviarWhatsappTurno({
+        telefono:      turnoExistente.telefono,
+        nombreCliente: turnoExistente.nombre,
+        businessName:  negocio?.business_name,
+        fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
+        servicio:      turnoExistente.servicio_nombre || "",
       });
     }
 
@@ -2009,7 +2048,8 @@ app.get("/settings/:slug", requireAuth, async (req, res) => {
         "slug, business_name, nombre_persona, apellido, email, telefono, " +
         "plan, duracion_turno, capacidad_por_turno, metodo_pago, porcentaje_sena, " +
         "horarios, excepciones, mp_access_token, " +
-        "estado_suscripcion, fecha_vencimiento, activo"
+        "estado_suscripcion, fecha_vencimiento, activo, " +
+        "acepta_transferencia, acepta_efectivo, datos_bancarios"
       )
       .eq("slug", slug).maybeSingle();
 
@@ -2040,6 +2080,9 @@ app.get("/settings/:slug", requireAuth, async (req, res) => {
         mp_status:           user.mp_access_token ? "Conectado" : "Desconectado",
         dias_restantes:      diasRestantes,
         alerta_vencimiento:  diasRestantes !== null && diasRestantes <= 5 && diasRestantes > 0,
+        acepta_transferencia: !!user.acepta_transferencia,
+        acepta_efectivo:      !!user.acepta_efectivo,
+        datos_bancarios:      user.datos_bancarios || {},
       },
     });
   } catch (e) {
@@ -2060,6 +2103,7 @@ app.put("/settings/:slug", requireAuth, async (req, res) => {
       "duracion_turno", "capacidad_por_turno",
       "metodo_pago", "porcentaje_sena",
       "horarios", "excepciones",
+      "acepta_transferencia", "acepta_efectivo", "datos_bancarios",
     ];
 
     const update = {};
@@ -2112,6 +2156,23 @@ app.put("/settings/:slug", requireAuth, async (req, res) => {
     }
     if (update.excepciones !== undefined && !validarExcepciones(update.excepciones)) {
       return res.status(400).json({ success: false, error: "Formato de excepciones inválido." });
+    }
+
+    if (update.acepta_transferencia !== undefined || update.acepta_efectivo !== undefined || update.datos_bancarios !== undefined) {
+      const { data: negocioActual } = await supabase.from("usuarios").select("plan").eq("slug", slug).maybeSingle();
+      if (!negocioActual) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+      if (negocioActual.plan !== "premium") {
+        return res.status(403).json({ success: false, error: "Transferencia y efectivo son exclusivos del plan Premium." });
+      }
+    }
+    if (update.acepta_transferencia !== undefined) {
+      update.acepta_transferencia = update.acepta_transferencia === true || update.acepta_transferencia === "true";
+    }
+    if (update.acepta_efectivo !== undefined) {
+      update.acepta_efectivo = update.acepta_efectivo === true || update.acepta_efectivo === "true";
+    }
+    if (update.datos_bancarios !== undefined && !validarDatosBancarios(update.datos_bancarios)) {
+      return res.status(400).json({ success: false, error: "Datos bancarios inválidos (revisá CBU/alias)." });
     }
 
     if (Object.keys(update).length === 0) {
