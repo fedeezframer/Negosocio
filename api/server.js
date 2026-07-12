@@ -48,6 +48,19 @@ const RENOVACION_CANCEL  = process.env.RENOVACION_CANCEL_URL      || `${PANEL_UR
 const PANEL_ORIGINS = (process.env.PANEL_ORIGINS || "https://turnits.com,https://www.turnits.com")
   .split(",").map((o) => o.trim()).filter(Boolean);
 
+const CBU_REGEX   = /^\d{22}$/;
+const ALIAS_REGEX = /^[a-zA-Z0-9._-]{6,30}$/;
+ 
+function validarDatosBancarios(d) {
+  if (typeof d !== "object" || d === null || Array.isArray(d)) return false;
+  const { banco, titular, cbu, alias } = d;
+  if (banco    !== undefined && (typeof banco    !== "string" || banco.length    > 60)) return false;
+  if (titular  !== undefined && (typeof titular  !== "string" || titular.length  > 80)) return false;
+  if (cbu   !== undefined && cbu   !== "" && !CBU_REGEX.test(cbu))     return false;
+  if (alias !== undefined && alias !== "" && !ALIAS_REGEX.test(alias)) return false;
+  return true;
+}
+
 // ══════════════════════════════════════════════════════════════
 // WHATSAPP CLOUD API — Config
 // Notificaciones de turno por WhatsApp usando la Cloud API oficial
@@ -1232,26 +1245,41 @@ app.get("/negocio/:slug", async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
     if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
-
+ 
     const { data: user, error } = await supabase.from("usuarios")
-      .select("slug, business_name, horarios, excepciones, duracion_turno, capacidad_por_turno, metodo_pago, porcentaje_sena, mp_access_token, activo, plan, estado_suscripcion, fecha_vencimiento, tema, logo_url")
+      .select(
+        "slug, business_name, horarios, excepciones, duracion_turno, capacidad_por_turno, " +
+        "metodo_pago, porcentaje_sena, mp_access_token, activo, plan, estado_suscripcion, " +
+        "fecha_vencimiento, tema, logo_url, acepta_transferencia, acepta_efectivo, datos_bancarios"
+      )
       .eq("slug", slug)
       .maybeSingle();
-
+ 
     if (error) throw error;
     if (!user)              return res.status(404).json({ success: false, error: "Negocio no encontrado." });
     if (!isActivo(user.activo)) return res.status(404).json({ success: false, error: "Negocio no disponible." });
-
+ 
     const diasRestantes  = user.fecha_vencimiento ? diasHastaVencer(user.fecha_vencimiento) : null;
     const estaSuspendido = user.estado_suscripcion === "suspendido" || (diasRestantes !== null && diasRestantes <= 0);
-
+ 
     if (estaSuspendido) {
       if (user.estado_suscripcion !== "suspendido") {
         supabase.from("usuarios").update({ estado_suscripcion: "suspendido" }).eq("slug", slug).then(() => {});
       }
       return res.json({ success: true, suspendido: true, negocio: { slug: user.slug, business_name: user.business_name } });
     }
-
+ 
+    const esPremium               = user.plan === "premium";
+    const mpDisponible            = !!user.mp_access_token && ["sena", "total"].includes(user.metodo_pago);
+    const transferenciaDisponible = esPremium && !!user.acepta_transferencia;
+    const efectivoDisponible      = esPremium && !!user.acepta_efectivo;
+ 
+    const metodos_pago_disponibles = [
+      ...(mpDisponible            ? ["mercadopago"]  : []),
+      ...(transferenciaDisponible ? ["transferencia"] : []),
+      ...(efectivoDisponible      ? ["efectivo"]      : []),
+    ];
+ 
     res.json({
       success: true,
       negocio: {
@@ -1267,6 +1295,8 @@ app.get("/negocio/:slug", async (req, res) => {
         plan:                user.plan                || "gratis",
         tema:                user.tema                || null,
         logo_url:            user.logo_url            || null,
+        metodos_pago_disponibles,
+        datos_bancarios:     transferenciaDisponible ? (user.datos_bancarios || {}) : null,
       },
     });
   } catch (e) {
