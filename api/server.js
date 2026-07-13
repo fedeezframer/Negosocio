@@ -1305,6 +1305,39 @@ app.get("/negocio/:slug", async (req, res) => {
   }
 });
 
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+ 
+app.get("/extras/:servicio_id", async (req, res) => {
+  try {
+    const { servicio_id } = req.params;
+    if (!servicio_id || !UUID_REGEX.test(servicio_id)) {
+      return res.status(400).json({ success: false, error: "servicio_id inválido." });
+    }
+ 
+    const { data: vinculos, error } = await supabase
+      .from("servicio_extras")
+      .select("extra_id, extras!inner(id, nombre, descripcion, precio, imagen_url, activo, orden)")
+      .eq("servicio_id", servicio_id)
+      .eq("extras.activo", true);
+ 
+    if (error) throw error;
+ 
+    const extras = (vinculos || [])
+      .map((v) => v.extras)
+      .filter(Boolean)
+      .sort((a, b) => (a.orden || 0) - (b.orden || 0))
+      .map(({ id, nombre, descripcion, precio, imagen_url }) => ({
+        id, nombre, descripcion, precio, imagen_url,
+      }));
+ 
+    res.json({ success: true, extras });
+  } catch (e) {
+    console.error("Error en /extras/:servicio_id:", e.message);
+    res.status(500).json({ success: false, error: "Error al obtener los extras." });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // SLOTS DISPONIBLES
 // GET /slots-disponibles/:slug
