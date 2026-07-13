@@ -1471,6 +1471,229 @@ app.post("/admin/servicios/upload-imagen", requireAuth, (req, res, next) => {
   }
 });
 
+const PRECIO_MINIMO_EXTRA = 100; // ajustá si querés otro piso
+ 
+function validarExtraBody({ nombre, precio }) {
+  if (!nombre || !nombre.trim() || nombre.trim().length > 80) return "Nombre inválido.";
+  const p = Number(precio);
+  if (!Number.isFinite(p) || p < PRECIO_MINIMO_EXTRA) return `El precio mínimo es $${PRECIO_MINIMO_EXTRA}.`;
+  return null;
+}
+ 
+// ══════════════════════════════════════════════════════════════
+// EXTRAS — ADMIN — CRUD
+// ══════════════════════════════════════════════════════════════
+ 
+// GET /admin/extras/:slug  — todos los productos del negocio
+app.get("/admin/extras/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { data, error } = await supabase.from("extras")
+      .select("*").eq("slug", slug)
+      .order("orden", { ascending: true }).order("created_at", { ascending: true });
+    if (error) throw error;
+    res.json({ success: true, extras: data || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Error al obtener los productos." });
+  }
+});
+ 
+// POST /admin/extras  — crear producto
+app.post("/admin/extras", requireAuth, async (req, res) => {
+  try {
+    const { slug, nombre, descripcion, precio, imagen_url, orden } = req.body;
+    const slugClean = cleanSlug(slug || req.auth.slug);
+ 
+    const errorValidacion = validarExtraBody({ nombre, precio });
+    if (errorValidacion) return res.status(400).json({ success: false, error: errorValidacion });
+    if (descripcion !== undefined && descripcion !== null && String(descripcion).length > 300) {
+      return res.status(400).json({ success: false, error: "La descripción es demasiado larga." });
+    }
+ 
+    const { data, error } = await supabase.from("extras").insert([{
+      slug: slugClean,
+      nombre: nombre.trim(),
+      descripcion: descripcion?.trim() || null,
+      precio: Number(precio),
+      imagen_url: imagen_url || null,
+      orden: parseInt(orden) || 0,
+      activo: true,
+    }]).select().single();
+ 
+    if (error) throw error;
+    res.status(201).json({ success: true, extra: data });
+  } catch (e) {
+    console.error("Error creando extra:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo crear el producto." });
+  }
+});
+ 
+// PUT /admin/extras/:id  — editar producto
+app.put("/admin/extras/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body.slug || req.auth.slug);
+    const { nombre, descripcion, precio, imagen_url, activo, orden } = req.body;
+ 
+    const update = {};
+    if (nombre !== undefined || precio !== undefined) {
+      // si se toca nombre o precio, revalidar el par completo contra
+      // lo que llegó (evita mandar un precio viejo inválido a mitad de edición)
+      const errorValidacion = validarExtraBody({
+        nombre: nombre !== undefined ? nombre : "placeholder",
+        precio: precio !== undefined ? precio : PRECIO_MINIMO_EXTRA,
+      });
+      if (nombre !== undefined && (!nombre || !nombre.trim() || nombre.trim().length > 80)) {
+        return res.status(400).json({ success: false, error: "Nombre inválido." });
+      }
+      if (precio !== undefined) {
+        const p = Number(precio);
+        if (!Number.isFinite(p) || p < PRECIO_MINIMO_EXTRA) {
+          return res.status(400).json({ success: false, error: `El precio mínimo es $${PRECIO_MINIMO_EXTRA}.` });
+        }
+        update.precio = p;
+      }
+      if (nombre !== undefined) update.nombre = nombre.trim();
+    }
+    if (descripcion !== undefined) {
+      if (descripcion !== null && String(descripcion).length > 300) {
+        return res.status(400).json({ success: false, error: "La descripción es demasiado larga." });
+      }
+      update.descripcion = descripcion?.trim() || null;
+    }
+    if (imagen_url !== undefined) update.imagen_url = imagen_url || null;
+    if (activo !== undefined) update.activo = activo === true || activo === "true";
+    if (orden !== undefined) update.orden = parseInt(orden) || 0;
+ 
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, error: "No hay campos para actualizar." });
+    }
+ 
+    const { data, error } = await supabase.from("extras")
+      .update(update).eq("id", id).eq("slug", slugClean)
+      .select().single();
+ 
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, error: "Producto no encontrado." });
+    res.json({ success: true, extra: data });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo actualizar el producto." });
+  }
+});
+ 
+// DELETE /admin/extras/:id
+// (servicio_extras tiene ON DELETE CASCADE, así que se desvincula solo)
+app.delete("/admin/extras/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
+    const { error } = await supabase.from("extras").delete().eq("id", id).eq("slug", slugClean);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo eliminar el producto." });
+  }
+});
+ 
+// POST /admin/extras/upload-imagen  — mismo patrón que servicios,
+// bucket "extras" en vez de "servicios"
+app.post("/admin/extras/upload-imagen", requireAuth, (req, res, next) => {
+  upload.single("imagen")(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, error: err.message });
+    next();
+  });
+}, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.body.slug || req.auth.slug);
+    if (!req.file) return res.status(400).json({ success: false, error: "No se recibió imagen." });
+ 
+    const ext = req.file.mimetype === "image/png" ? "png" : req.file.mimetype === "image/webp" ? "webp" : "jpg";
+    const fileName = `${slug}/${Date.now()}.${ext}`;
+ 
+    const { error } = await supabase.storage
+      .from("extras")
+      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype, upsert: true });
+ 
+    if (error) throw error;
+ 
+    const { data } = supabase.storage.from("extras").getPublicUrl(fileName);
+    res.json({ success: true, url: data.publicUrl });
+  } catch (e) {
+    console.error("Error upload imagen extra:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo subir la imagen." });
+  }
+});
+ 
+// ══════════════════════════════════════════════════════════════
+// EXTRAS — VINCULACIÓN CON SERVICIOS (tabla servicio_extras)
+// ══════════════════════════════════════════════════════════════
+ 
+// GET /admin/servicios/:id/extras-disponibles
+// Todos los productos del negocio + cuál está vinculado a ESTE
+// servicio en particular. Pensado para pintar de una sola vez el
+// selector de "Productos relacionados" en el panel.
+app.get("/admin/servicios/:id/extras-disponibles", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.query.slug || req.auth.slug);
+ 
+    const [{ data: extras, error: e1 }, { data: vinculos, error: e2 }] = await Promise.all([
+      supabase.from("extras").select("*").eq("slug", slugClean)
+        .order("orden", { ascending: true }).order("created_at", { ascending: true }),
+      supabase.from("servicio_extras").select("extra_id").eq("servicio_id", id),
+    ]);
+    if (e1) throw e1;
+    if (e2) throw e2;
+ 
+    const vinculadosSet = new Set((vinculos || []).map((v) => v.extra_id));
+    const resultado = (extras || []).map((e) => ({ ...e, vinculado: vinculadosSet.has(e.id) }));
+ 
+    res.json({ success: true, extras: resultado });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Error al obtener los productos." });
+  }
+});
+ 
+// POST /admin/servicios/:id/extras  — vincular un producto existente
+app.post("/admin/servicios/:id/extras", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { extra_id } = req.body;
+    const slugClean = cleanSlug(req.body.slug || req.auth.slug);
+    if (!extra_id) return res.status(400).json({ success: false, error: "Falta extra_id." });
+ 
+    // Validar que el servicio y el extra sean del mismo negocio
+    // (evita que alguien vincule un extra de otro negocio a mano).
+    const [{ data: servicio }, { data: extra }] = await Promise.all([
+      supabase.from("servicios").select("id").eq("id", id).eq("slug", slugClean).maybeSingle(),
+      supabase.from("extras").select("id").eq("id", extra_id).eq("slug", slugClean).maybeSingle(),
+    ]);
+    if (!servicio) return res.status(404).json({ success: false, error: "Servicio no encontrado." });
+    if (!extra) return res.status(404).json({ success: false, error: "Producto no encontrado." });
+ 
+    const { error } = await supabase.from("servicio_extras")
+      .upsert([{ servicio_id: id, extra_id }], { onConflict: "servicio_id,extra_id" });
+    if (error) throw error;
+ 
+    res.status(201).json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo vincular el producto." });
+  }
+});
+ 
+// DELETE /admin/servicios/:id/extras/:extra_id  — desvincular
+app.delete("/admin/servicios/:id/extras/:extra_id", requireAuth, async (req, res) => {
+  try {
+    const { id, extra_id } = req.params;
+    const { error } = await supabase.from("servicio_extras")
+      .delete().eq("servicio_id", id).eq("extra_id", extra_id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo desvincular el producto." });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // LISTA DE ESPERA
 // ══════════════════════════════════════════════════════════════
