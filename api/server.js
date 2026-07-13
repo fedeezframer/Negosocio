@@ -1479,7 +1479,168 @@ function validarExtraBody({ nombre, precio }) {
   if (!Number.isFinite(p) || p < PRECIO_MINIMO_EXTRA) return `El precio mínimo es $${PRECIO_MINIMO_EXTRA}.`;
   return null;
 }
- 
+
+// ══════════════════════════════════════════════════════════════
+// SERVICIOS — ADMIN — CRUD
+// FIX: estas rutas faltaban por completo. Es la causa del
+// "Ruta no encontrada" al crear/editar/listar servicios desde el
+// panel — ServiciosManager.tsx llama a GET/POST/PUT/DELETE
+// /admin/servicios(/:id) y ninguna de esas rutas existía, así que
+// caían en el handler 404 genérico. Los servicios viejos no se
+// borraron de la base: el panel simplemente no podía traerlos
+// porque GET /admin/servicios/:slug no existía.
+// ══════════════════════════════════════════════════════════════
+
+const PRECIO_MINIMO_SERVICIO = 2500; // mismo piso que usa el form en ServiciosManager.tsx
+
+function validarServicioBody({ nombre, precio }) {
+  if (!nombre || !nombre.trim() || nombre.trim().length > 80) return "Nombre inválido.";
+  const p = Number(precio);
+  if (!Number.isFinite(p) || p < PRECIO_MINIMO_SERVICIO) return `El precio mínimo es $${PRECIO_MINIMO_SERVICIO}.`;
+  return null;
+}
+
+// GET /admin/servicios/:slug — todos los servicios del negocio (activos e inactivos)
+app.get("/admin/servicios/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { data, error } = await supabase.from("servicios")
+      .select("id, nombre, descripcion, duracion, precio, capacidad, activo, orden")
+      .eq("slug", slug)
+      .order("orden", { ascending: true }).order("created_at", { ascending: true });
+    if (error) throw error;
+
+    // FIX: mismo criterio que "usuarios.activo" — se guarda como texto
+    // ("true"/"false"), no boolean, así que se normaliza con isActivo()
+    // antes de devolverlo (el frontend espera un boolean real).
+    const servicios = (data || []).map((s) => ({ ...s, activo: isActivo(s.activo) }));
+    res.json({ success: true, servicios });
+  } catch (e) {
+    console.error("Error en GET /admin/servicios:", e.message);
+    res.status(500).json({ success: false, error: "Error al obtener los servicios." });
+  }
+});
+
+// POST /admin/servicios — crear servicio
+app.post("/admin/servicios", requireAuth, async (req, res) => {
+  try {
+    const { slug, nombre, descripcion, duracion, precio, capacidad, orden } = req.body;
+    const slugClean = cleanSlug(slug || req.auth.slug);
+
+    const errorValidacion = validarServicioBody({ nombre, precio });
+    if (errorValidacion) return res.status(400).json({ success: false, error: errorValidacion });
+    if (descripcion !== undefined && descripcion !== null && String(descripcion).length > 1000) {
+      return res.status(400).json({ success: false, error: "La descripción es demasiado larga." });
+    }
+
+    const dur = parseInt(duracion);
+    const cap = parseInt(capacidad);
+
+    const { data, error } = await supabase.from("servicios").insert([{
+      slug: slugClean,
+      nombre: nombre.trim(),
+      descripcion: descripcion?.trim() || null,
+      duracion: Number.isFinite(dur) && dur > 0 ? dur : 30,
+      precio: Number(precio),
+      capacidad: Number.isFinite(cap) && cap > 0 ? cap : 1,
+      orden: parseInt(orden) || 0,
+      activo: "true",
+    }]).select().single();
+
+    if (error) throw error;
+    invalidateCache(slugClean);
+    res.status(201).json({ success: true, servicio: { ...data, activo: isActivo(data.activo) } });
+  } catch (e) {
+    console.error("Error creando servicio:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo crear el servicio." });
+  }
+});
+
+// PUT /admin/servicios/:id — editar servicio (también usada para el toggle activo/inactivo)
+app.put("/admin/servicios/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body.slug || req.auth.slug);
+    const { nombre, descripcion, duracion, precio, capacidad, orden, activo } = req.body;
+
+    const update = {};
+
+    if (nombre !== undefined) {
+      if (!nombre || !nombre.trim() || nombre.trim().length > 80) {
+        return res.status(400).json({ success: false, error: "Nombre inválido." });
+      }
+      update.nombre = nombre.trim();
+    }
+    if (precio !== undefined) {
+      const p = Number(precio);
+      if (!Number.isFinite(p) || p < PRECIO_MINIMO_SERVICIO) {
+        return res.status(400).json({ success: false, error: `El precio mínimo es $${PRECIO_MINIMO_SERVICIO}.` });
+      }
+      update.precio = p;
+    }
+    if (descripcion !== undefined) {
+      if (descripcion !== null && String(descripcion).length > 1000) {
+        return res.status(400).json({ success: false, error: "La descripción es demasiado larga." });
+      }
+      update.descripcion = descripcion?.trim() || null;
+    }
+    if (duracion !== undefined) {
+      const d = parseInt(duracion);
+      if (!Number.isFinite(d) || d <= 0 || d > 1440) {
+        return res.status(400).json({ success: false, error: "Duración inválida." });
+      }
+      update.duracion = d;
+    }
+    if (capacidad !== undefined) {
+      const c = parseInt(capacidad);
+      if (!Number.isFinite(c) || c <= 0 || c > 500) {
+        return res.status(400).json({ success: false, error: "Capacidad inválida." });
+      }
+      update.capacidad = c;
+    }
+    if (orden !== undefined) update.orden = parseInt(orden) || 0;
+    if (activo !== undefined) update.activo = (activo === true || activo === "true") ? "true" : "false";
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, error: "No hay campos para actualizar." });
+    }
+
+    const { data, error } = await supabase.from("servicios")
+      .update(update).eq("id", id).eq("slug", slugClean)
+      .select().single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, error: "Servicio no encontrado." });
+
+    invalidateCache(slugClean);
+    res.json({ success: true, servicio: { ...data, activo: isActivo(data.activo) } });
+  } catch (e) {
+    console.error("Error actualizando servicio:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo actualizar el servicio." });
+  }
+});
+
+// DELETE /admin/servicios/:id
+// NOTA: si algún turno viejo quedó referenciando este servicio_id
+// (columna turnos.servicio_id) y esa FK no tiene ON DELETE SET NULL
+// o CASCADE, el DELETE puede fallar. Si te pasa eso, contame y
+// lo resolvemos (lo más simple: ON DELETE SET NULL en esa FK, ya
+// que turnos guarda servicio_nombre/precio_cobrado como snapshot
+// y no depende de que el servicio siga existiendo).
+app.delete("/admin/servicios/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
+    const { error } = await supabase.from("servicios").delete().eq("id", id).eq("slug", slugClean);
+    if (error) throw error;
+    invalidateCache(slugClean);
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Error eliminando servicio:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo eliminar el servicio." });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // EXTRAS — ADMIN — CRUD
 // ══════════════════════════════════════════════════════════════
