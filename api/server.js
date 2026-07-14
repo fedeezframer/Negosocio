@@ -2121,9 +2121,9 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
   });
 }, async (req, res) => {
   try {
-const { name, apellido, phone, email, fecha, hora, slug, servicio_id, metodo_pago } = req.body;
-let extraIds = [];
-try { extraIds = JSON.parse(req.body.extra_ids || "[]"); } catch { extraIds = []; }
+    const { name, apellido, phone, email, fecha, hora, slug, servicio_id, metodo_pago } = req.body;
+    let extraIds = [];
+    try { extraIds = JSON.parse(req.body.extra_ids || "[]"); } catch { extraIds = []; }
     const slugClean = cleanSlug(slug || "");
 
     if (!name || !phone || !fecha || !hora || !slugClean || !metodo_pago) {
@@ -2165,27 +2165,15 @@ try { extraIds = JSON.parse(req.body.extra_ids || "[]"); } catch { extraIds = []
       return res.status(403).json({ success: false, error: "Este negocio no acepta pagos en efectivo." });
     }
 
-    const hoy = new Date().toISOString().split("T")[0];
     const emailClean = email?.trim().toLowerCase();
-    const [porTelefono, porEmail] = await Promise.all([
-      supabase.from("turnos").select("id")
-        .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("telefono", phoneClean),
-      emailClean
-        ? supabase.from("turnos").select("id")
-            .eq("slug", slugClean).gte("fecha", hoy).neq("estado", "cancelado").eq("email", emailClean)
-        : Promise.resolve({ data: [] }),
-    ]);
-    if ([...(porTelefono.data || []), ...(porEmail.data || [])].length > 0) {
-      return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
-    }
 
-let capacidad      = user.capacidad_por_turno || 1;
-let servicioNombre = null;
-let precioCobrado  = 0;
-if (servicio_id) {
-  const { data: srv } = await supabase.from("servicios").select("nombre, capacidad, precio").eq("id", servicio_id).maybeSingle();
-  if (srv) { servicioNombre = srv.nombre; capacidad = srv.capacidad || capacidad; precioCobrado = Number(srv.precio || 0); }
-}
+    let capacidad      = user.capacidad_por_turno || 1;
+    let servicioNombre = null;
+    let precioCobrado  = 0;
+    if (servicio_id) {
+      const { data: srv } = await supabase.from("servicios").select("nombre, capacidad, precio").eq("id", servicio_id).maybeSingle();
+      if (srv) { servicioNombre = srv.nombre; capacidad = srv.capacidad || capacidad; precioCobrado = Number(srv.precio || 0); }
+    }
     const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extraIds);
 
     const { count } = await supabase.from("turnos").select("id", { count: "exact" })
@@ -2201,18 +2189,18 @@ if (servicio_id) {
       if (upErr) throw upErr;
     }
 
-const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
-  slug: slugClean, nombre: name.trim(), apellido: apellido?.trim().slice(0, 80) || null,
-  telefono: phoneClean, email: emailClean || null, fecha, hora,
-  servicio_id: servicio_id || null, servicio_nombre: servicioNombre,
-  precio_cobrado: precioCobrado + montoExtras,   // ← total real
-  extras: extrasResueltos,                        // ← nuevo
-  monto_extras: montoExtras,                      // ← nuevo
-  monto_pagado: 0,
-  estado: "pendiente", metodo_pago,
-  pago_estado: metodo_pago === "transferencia" ? "pendiente" : "sin_pago",
-  comprobante_path: comprobantePath,
-}]).select().single();
+    const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
+      slug: slugClean, nombre: name.trim(), apellido: apellido?.trim().slice(0, 80) || null,
+      telefono: phoneClean, email: emailClean || null, fecha, hora,
+      servicio_id: servicio_id || null, servicio_nombre: servicioNombre,
+      precio_cobrado: precioCobrado + montoExtras,   // ← total real
+      extras: extrasResueltos,                        // ← nuevo
+      monto_extras: montoExtras,                      // ← nuevo
+      monto_pagado: 0,
+      estado: "pendiente", metodo_pago,
+      pago_estado: metodo_pago === "transferencia" ? "pendiente" : "sin_pago",
+      comprobante_path: comprobantePath,
+    }]).select().single();
     if (turnoError) throw turnoError;
 
     // Mail al vendedor avisando que hay un turno para aprobar.
