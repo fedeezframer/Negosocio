@@ -1307,7 +1307,31 @@ app.get("/negocio/:slug", async (req, res) => {
 
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
- 
+
+async function resolverExtras(slugClean, servicioId, extraIdsRaw) {
+  const ids = Array.isArray(extraIdsRaw)
+    ? [...new Set(extraIdsRaw.filter((id) => typeof id === "string" && UUID_REGEX.test(id)))]
+    : [];
+  if (ids.length === 0) return { extras: [], montoExtras: 0 };
+
+  const { data: extrasDB } = await supabase.from("extras")
+    .select("id, nombre, precio").eq("slug", slugClean).eq("activo", true).in("id", ids);
+  if (!extrasDB?.length) return { extras: [], montoExtras: 0 };
+
+  let permitidos = new Set(extrasDB.map((e) => e.id));
+  if (servicioId) {
+    const { data: vinculos } = await supabase.from("servicio_extras")
+      .select("extra_id").eq("servicio_id", servicioId).in("extra_id", [...permitidos]);
+    permitidos = new Set((vinculos || []).map((v) => v.extra_id));
+  }
+
+  const extras = extrasDB
+    .filter((e) => permitidos.has(e.id))
+    .map((e) => ({ id: e.id, nombre: e.nombre, precio: Number(e.precio) || 0 }));
+  const montoExtras = extras.reduce((acc, e) => acc + e.precio, 0);
+  return { extras, montoExtras };
+}
+
 app.get("/extras/:servicio_id", async (req, res) => {
   try {
     const { servicio_id } = req.params;
@@ -1956,7 +1980,7 @@ app.get("/cron/limpiar-lista-espera", requireAdminKey, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 app.post("/turnos/reservar", limiterBooking, async (req, res) => {
   try {
-    const { name, phone, email, fecha, hora, slug, servicio_id, apellido } = req.body;
+    const { name, phone, email, fecha, hora, slug, servicio_id, apellido, extra_ids } = req.body;
     const slugClean = cleanSlug(slug || "");
 
     if (!name || !phone || !fecha || !hora || !slugClean) {
@@ -2005,41 +2029,45 @@ app.post("/turnos/reservar", limiterBooking, async (req, res) => {
     const turnosExistentes = [...(porTelefono.data || []), ...(porEmail.data || [])];
     if (turnosExistentes.length > 0) return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
 
-    let capacidad      = user.capacidad_por_turno || 1;
-    let servicioNombre = null;
-    let precioCobrado  = 0;
+let capacidad      = user.capacidad_por_turno || 1;
+let servicioNombre = null;
+let precioCobrado  = 0;
 
-    if (servicio_id) {
-      const { data: srv } = await supabase.from("servicios")
-        .select("nombre, capacidad, precio")
-        .eq("id", servicio_id).maybeSingle();
-      if (srv) {
-        servicioNombre = srv.nombre;
-        capacidad      = srv.capacidad || capacidad;
-        precioCobrado  = Number(srv.precio || 0);
-      }
-    }
+if (servicio_id) {
+  const { data: srv } = await supabase.from("servicios")
+    .select("nombre, capacidad, precio")
+    .eq("id", servicio_id).maybeSingle();
+  if (srv) {
+    servicioNombre = srv.nombre;
+    capacidad      = srv.capacidad || capacidad;
+    precioCobrado  = Number(srv.precio || 0);
+  }
+}
+
+const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extra_ids);
 
     const { count } = await supabase.from("turnos").select("id", { count: "exact" })
       .eq("slug", slugClean).eq("fecha", fecha).eq("hora", hora).neq("estado", "cancelado");
     if (count >= capacidad) return res.status(400).json({ success: false, error: "Este turno ya está lleno." });
 
-    const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
-      slug:            slugClean,
-      nombre:          name.trim(),
-      telefono:        phoneClean,
-      apellido:        apellido?.trim().slice(0, 80) || null,
-      email:           emailClean || null,
-      fecha,
-      hora,
-      servicio_id:     servicio_id || null,
-      servicio_nombre: servicioNombre,
-      precio_cobrado:  precioCobrado,
-      monto_pagado:    0,
-      estado:          "confirmado",
-      metodo_pago:     "none",
-      pago_estado:     "sin_pago",
-    }]).select().single();
+const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
+  slug:            slugClean,
+  nombre:          name.trim(),
+  telefono:        phoneClean,
+  apellido:        apellido?.trim().slice(0, 80) || null,
+  email:           emailClean || null,
+  fecha,
+  hora,
+  servicio_id:     servicio_id || null,
+  servicio_nombre: servicioNombre,
+  precio_cobrado:  precioCobrado + montoExtras,   // ← total real
+  extras:          extrasResueltos,               // ← nuevo
+  monto_extras:    montoExtras,                   // ← nuevo
+  monto_pagado:    0,
+  estado:          "confirmado",
+  metodo_pago:     "none",
+  pago_estado:     "sin_pago",
+}]).select().single();
     if (turnoError) throw turnoError;
     
     enviarMailTurno({
@@ -2093,7 +2121,9 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
   });
 }, async (req, res) => {
   try {
-    const { name, apellido, phone, email, fecha, hora, slug, servicio_id, metodo_pago } = req.body;
+const { name, apellido, phone, email, fecha, hora, slug, servicio_id, metodo_pago } = req.body;
+let extraIds = [];
+try { extraIds = JSON.parse(req.body.extra_ids || "[]"); } catch { extraIds = []; }
     const slugClean = cleanSlug(slug || "");
 
     if (!name || !phone || !fecha || !hora || !slugClean || !metodo_pago) {
@@ -2149,13 +2179,14 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       return res.status(400).json({ success: false, error: "Ya tenés un turno agendado activo." });
     }
 
-    let capacidad      = user.capacidad_por_turno || 1;
-    let servicioNombre = null;
-    let precioCobrado  = 0;
-    if (servicio_id) {
-      const { data: srv } = await supabase.from("servicios").select("nombre, capacidad, precio").eq("id", servicio_id).maybeSingle();
-      if (srv) { servicioNombre = srv.nombre; capacidad = srv.capacidad || capacidad; precioCobrado = Number(srv.precio || 0); }
-    }
+let capacidad      = user.capacidad_por_turno || 1;
+let servicioNombre = null;
+let precioCobrado  = 0;
+if (servicio_id) {
+  const { data: srv } = await supabase.from("servicios").select("nombre, capacidad, precio").eq("id", servicio_id).maybeSingle();
+  if (srv) { servicioNombre = srv.nombre; capacidad = srv.capacidad || capacidad; precioCobrado = Number(srv.precio || 0); }
+}
+    const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extraIds);
 
     const { count } = await supabase.from("turnos").select("id", { count: "exact" })
       .eq("slug", slugClean).eq("fecha", fecha).eq("hora", hora).neq("estado", "cancelado");
@@ -2170,15 +2201,18 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       if (upErr) throw upErr;
     }
 
-    const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
-      slug: slugClean, nombre: name.trim(), apellido: apellido?.trim().slice(0, 80) || null,
-      telefono: phoneClean, email: emailClean || null, fecha, hora,
-      servicio_id: servicio_id || null, servicio_nombre: servicioNombre,
-      precio_cobrado: precioCobrado, monto_pagado: 0,
-      estado: "pendiente", metodo_pago,
-      pago_estado: metodo_pago === "transferencia" ? "pendiente" : "sin_pago",
-      comprobante_path: comprobantePath,
-    }]).select().single();
+const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
+  slug: slugClean, nombre: name.trim(), apellido: apellido?.trim().slice(0, 80) || null,
+  telefono: phoneClean, email: emailClean || null, fecha, hora,
+  servicio_id: servicio_id || null, servicio_nombre: servicioNombre,
+  precio_cobrado: precioCobrado + montoExtras,   // ← total real
+  extras: extrasResueltos,                        // ← nuevo
+  monto_extras: montoExtras,                      // ← nuevo
+  monto_pagado: 0,
+  estado: "pendiente", metodo_pago,
+  pago_estado: metodo_pago === "transferencia" ? "pendiente" : "sin_pago",
+  comprobante_path: comprobantePath,
+}]).select().single();
     if (turnoError) throw turnoError;
 
     // Mail al vendedor avisando que hay un turno para aprobar.
@@ -3254,7 +3288,7 @@ app.get("/auth/reset-token-info", async (req, res) => {
 app.post("/api/create-preference", limiterBooking, async (req, res) => {
   console.log("📥 create-preference body:", JSON.stringify(req.body));
   try {
-    const { nombre, telefono, email, fecha, hora, slug, servicio_id, apellido } = req.body;
+    const { nombre, telefono, email, fecha, hora, slug, servicio_id, apellido, extra_ids } = req.body;
     const slugClean = cleanSlug(slug || "");
     if (!nombre || !telefono || !fecha || !hora || !slugClean) {
       return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
@@ -3268,47 +3302,56 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
     const estaSuspendido = user.estado_suscripcion === "suspendido" || (diasRestantes !== null && diasRestantes <= 0);
     if (estaSuspendido) return res.status(403).json({ success: false, error: "Este servicio está pausado temporalmente." });
 
-    let precioServicio = 0, nombreServicio = "Reserva";
-    if (servicio_id) {
-      const { data: srv } = await supabase.from("servicios").select("nombre, precio").eq("id", servicio_id).eq("slug", slugClean).maybeSingle();
-      if (srv) { precioServicio = Number(srv.precio || 0); nombreServicio = srv.nombre; }
-    }
+let precioServicio = 0, nombreServicio = "Reserva";
+if (servicio_id) {
+  const { data: srv } = await supabase.from("servicios").select("nombre, precio").eq("id", servicio_id).eq("slug", slugClean).maybeSingle();
+  if (srv) { precioServicio = Number(srv.precio || 0); nombreServicio = srv.nombre; }
+}
 
-    const metodo    = user.metodo_pago || "none";
-    const debePagar = metodo === "sena" || metodo === "total";
-    if (!debePagar || precioServicio <= 0) return res.json({ isFree: true });
+const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extra_ids);
 
-    const montoACobrar = metodo === "sena"
-      ? Math.round(precioServicio * (user.porcentaje_sena || 30) / 100)
-      : precioServicio;
-    const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
-    const fee = Math.max(350, Math.round(montoACobrar * 0.02));
+const metodo    = user.metodo_pago || "none";
+const debePagar = metodo === "sena" || metodo === "total";
+if (!debePagar || (precioServicio <= 0 && montoExtras <= 0)) return res.json({ isFree: true });
 
-    if (user.mp_access_token) {
-      try {
-        // 1) Crear registro de pago pendiente — fuente de verdad para el webhook
-        const metaPendiente = {
-          slug: slugClean,
-          nombre, telefono: cleanPhone(telefono), email: email || "",
-          apellido: apellido || "", fecha, hora,
-          servicio_id: servicio_id || null, servicio_nombre: nombreServicio,
-          precio_servicio: precioServicio, metodo_pago: metodo, monto: montoACobrar,
-          estado: "pendiente",
-        };
-        const { data: pendiente, error: pendError } = await supabase
-          .from("pagos_pendientes").insert([metaPendiente]).select("id").single();
-        if (pendError) throw pendError;
+const montoServicio = metodo === "sena"
+  ? Math.round(precioServicio * (user.porcentaje_sena || 30) / 100)
+  : precioServicio;
+const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
 
-        const client   = new MercadoPagoConfig({ accessToken: user.mp_access_token });
-        const pref     = new Preference(client);
-        const prefBody = {
-          items: [{ title: `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`, unit_price: montoACobrar, quantity: 1, currency_id: "ARS" }],
-          metadata: metaPendiente,
-          external_reference: pendiente.id,
-          notification_url: `${API_URL}/webhook/mp`,
-          back_urls: { success: `${SUCCESS_URL}?slug=${slugClean}`, failure: `${ERROR_URL}?slug=${slugClean}`, pending: `${ERROR_URL}?slug=${slugClean}` },
-          auto_return: "approved",
-        };
+const montoACobrar = montoServicio + montoExtras;   // ← total real: servicio + productos
+const fee = Math.max(350, Math.round(montoACobrar * 0.02));
+
+if (user.mp_access_token) {
+  try {
+    const metaPendiente = {
+      slug: slugClean,
+      nombre, telefono: cleanPhone(telefono), email: email || "",
+      apellido: apellido || "", fecha, hora,
+      servicio_id: servicio_id || null, servicio_nombre: nombreServicio,
+      precio_servicio: precioServicio, metodo_pago: metodo, monto: montoACobrar,
+      extras: extrasResueltos, monto_extras: montoExtras,   // ← nuevo
+      estado: "pendiente",
+    };
+    const { data: pendiente, error: pendError } = await supabase
+      .from("pagos_pendientes").insert([metaPendiente]).select("id").single();
+    if (pendError) throw pendError;
+
+    const client = new MercadoPagoConfig({ accessToken: user.mp_access_token });
+    const pref   = new Preference(client);
+
+        const items = [
+      { title: `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`, unit_price: montoServicio, quantity: 1, currency_id: "ARS" },
+      ...extrasResueltos.map((e) => ({ title: e.nombre, unit_price: e.precio, quantity: 1, currency_id: "ARS" })),
+    ];
+    const prefBody = {
+      items,
+      metadata: metaPendiente,
+      external_reference: pendiente.id,
+      notification_url: `${API_URL}/webhook/mp`,
+      back_urls: { success: `${SUCCESS_URL}?slug=${slugClean}`, failure: `${ERROR_URL}?slug=${slugClean}`, pending: `${ERROR_URL}?slug=${slugClean}` },
+      auto_return: "approved",
+    };
         if (fee > 0) prefBody.marketplace_fee = fee;
         const response = await pref.create({ body: prefBody });
 
@@ -3462,7 +3505,7 @@ app.get("/oauth-callback", async (req, res) => {
 // o reembolse manualmente, en vez de confirmar un turno por encima
 // de la capacidad.
 // ══════════════════════════════════════════════════════════════
-async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, monto, moneda, metodo_pago, precio_servicio, payment_id, estado, porcentaje_sena }) {
+async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, monto, moneda, metodo_pago, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras }) {
   const { data: turnoExistente } = await supabase
     .from("turnos").select("id").eq("payment_id", String(payment_id)).maybeSingle();
   if (turnoExistente) { console.log(`⚠️ Pago ${payment_id} ya procesado, ignorando.`); return; }
@@ -3499,11 +3542,14 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       return;
     }
 
-    const { error: turnoError } = await supabase.from("turnos").insert([{
+const { error: turnoError } = await supabase.from("turnos").insert([{
       slug, nombre: nombre?.trim() || "Cliente", apellido: apellido?.trim() || null,
       telefono: cleanPhone(telefono?.toString() || "0"), email: email?.trim().toLowerCase() || null,
       fecha, hora, servicio_id: servicio_id || null, servicio_nombre: servicio_nombre || null,
-      precio_cobrado: precio_servicio || monto, monto_pagado: monto,
+      precio_cobrado: Number(precio_servicio || 0) + Number(monto_extras || 0),  // ← total real
+      monto_pagado: monto,
+      extras: extras || [],            // ← nuevo
+      monto_extras: monto_extras || 0, // ← nuevo
       porcentaje_sena: metodo_pago === "sena" ? porcSena : null,
       metodo_pago, pago_estado: pagoEstado, fecha_pago: new Date().toISOString(),
       moneda: moneda || "ARS", estado: "confirmado", payment_id: String(payment_id),
@@ -3613,6 +3659,8 @@ app.post("/webhook/mp", async (req, res) => {
         precio_servicio:  meta.precio_servicio || null,
         payment_id:       paymentId,
         estado,
+        extras: meta.extras || [],
+        monto_extras: meta.monto_extras || 0
       });
 
       if (pendiente) {
