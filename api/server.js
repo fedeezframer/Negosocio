@@ -2345,11 +2345,11 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
 
     const updateData = { estado };
     if (notas !== undefined) updateData.notas = notas;
-    if (esAprobacionManual && turnoExistente.metodo_pago === "transferencia") {
-      updateData.pago_estado  = "aprobado";
-      updateData.monto_pagado = turnoExistente.precio_cobrado || 0;
-      updateData.fecha_pago   = new Date().toISOString();
-    }
+if (esAprobacionManual) {
+  updateData.pago_estado  = "aprobado";
+  updateData.monto_pagado = turnoExistente.precio_cobrado || 0;
+  updateData.fecha_pago   = new Date().toISOString();
+}
 
     const { data: turnoActualizado, error: updateError } = await supabase
       .from("turnos").update(updateData).eq("id", id).eq("slug", slugClean).select().single();
