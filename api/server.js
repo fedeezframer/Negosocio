@@ -50,6 +50,8 @@ const PANEL_ORIGINS = (process.env.PANEL_ORIGINS || "https://turnits.com,https:/
 
 const CBU_REGEX   = /^\d{22}$/;
 const ALIAS_REGEX = /^[a-zA-Z0-9._-]{6,30}$/;
+
+const REPROGRAMAR_URL = process.env.REPROGRAMAR_URL || "https://turnits.com/reprogramar";
  
 function validarDatosBancarios(d) {
   if (typeof d !== "object" || d === null || Array.isArray(d)) return false;
@@ -59,6 +61,13 @@ function validarDatosBancarios(d) {
   if (cbu   !== undefined && cbu   !== "" && !CBU_REGEX.test(cbu))     return false;
   if (alias !== undefined && alias !== "" && !ALIAS_REGEX.test(alias)) return false;
   return true;
+}
+
+function tokenDeGestionValido(tokenRecibido, tokenReal) {
+  if (!tokenRecibido || !tokenReal) return false;
+  const a = Buffer.from(String(tokenRecibido));
+  const b = Buffer.from(String(tokenReal));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -258,6 +267,14 @@ function validarExcepciones(excepciones) {
     }
     return true;
   });
+}
+
+function horaDentroDeIntervalos(horarios, excepciones, fecha, hora) {
+  const intervalos = obtenerIntervalosDia(horarios, excepciones, fecha);
+  if (!intervalos) return false;
+  const [h, m] = hora.split(":").map(Number);
+  const minutos = h * 60 + m;
+  return intervalos.some(([ini, fin]) => minutos >= ini && minutos < fin);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2627,6 +2644,313 @@ app.put("/settings/:slug", requireAuth, async (req, res) => {
     res.json({ success: true, updated: Object.keys(update) });
   } catch (e) {
     res.status(500).json({ success: false, error: "No se pudo actualizar la configuración." });
+  }
+});
+
+app.get("/reprogramar/info/:turno_id", async (req, res) => {
+  try {
+    const { turno_id } = req.params;
+    const slug  = cleanSlug(req.query.slug || "");
+    const token = req.query.token || "";
+ 
+    if (!turno_id || !UUID_REGEX.test(turno_id) || !slug || !token) {
+      return res.status(400).json({ success: false, error: "Parámetros inválidos." });
+    }
+ 
+    const { data: turno, error } = await supabase.from("turnos")
+      .select("id, slug, nombre, fecha, hora, servicio_nombre, estado, gestion_token")
+      .eq("id", turno_id).eq("slug", slug).maybeSingle();
+    if (error) throw error;
+    if (!turno) return res.status(404).json({ success: false, error: "Turno no encontrado." });
+    if (!tokenDeGestionValido(token, turno.gestion_token)) {
+      return res.status(403).json({ success: false, error: "Link inválido." });
+    }
+ 
+    const { data: pendiente } = await supabase.from("reprogramaciones")
+      .select("id, fecha_propuesta, hora_propuesta")
+      .eq("turno_id", turno_id).eq("estado", "pendiente").maybeSingle();
+ 
+    const hoy = new Date().toISOString().split("T")[0];
+    const puedeReprogramar =
+      ["confirmado", "pendiente"].includes(turno.estado) &&
+      turno.fecha >= hoy &&
+      !pendiente;
+ 
+    res.json({
+      success: true,
+      turno: {
+        nombre:    turno.nombre,
+        fecha:     turno.fecha,
+        hora:      turno.hora.slice(0, 5),
+        servicio:  turno.servicio_nombre,
+        estado:    turno.estado,
+      },
+      puede_reprogramar: puedeReprogramar,
+      solicitud_pendiente: pendiente
+        ? { fecha_propuesta: pendiente.fecha_propuesta, hora_propuesta: pendiente.hora_propuesta }
+        : null,
+    });
+  } catch (e) {
+    console.error("Error en /reprogramar/info:", e.message);
+    res.status(500).json({ success: false, error: "Error al obtener el turno." });
+  }
+});
+ 
+// POST /reprogramar/solicitar
+// Body: { turno_id, slug, token, fecha_nueva, hora_nueva }
+app.post("/reprogramar/solicitar", limiterBooking, async (req, res) => {
+  try {
+    const { turno_id, slug, token, fecha_nueva, hora_nueva } = req.body;
+    const slugClean = cleanSlug(slug || "");
+ 
+    if (!turno_id || !UUID_REGEX.test(turno_id) || !slugClean || !token || !fecha_nueva || !hora_nueva) {
+      return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha_nueva)) {
+      return res.status(400).json({ success: false, error: "Formato de fecha inválido." });
+    }
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(hora_nueva)) {
+      return res.status(400).json({ success: false, error: "Formato de hora inválido." });
+    }
+ 
+    const { data: turno, error: turnoError } = await supabase.from("turnos")
+      .select("id, slug, fecha, hora, estado, servicio_id, gestion_token")
+      .eq("id", turno_id).eq("slug", slugClean).maybeSingle();
+    if (turnoError) throw turnoError;
+    if (!turno) return res.status(404).json({ success: false, error: "Turno no encontrado." });
+    if (!tokenDeGestionValido(token, turno.gestion_token)) {
+      return res.status(403).json({ success: false, error: "Link inválido." });
+    }
+    if (!["confirmado", "pendiente"].includes(turno.estado)) {
+      return res.status(400).json({ success: false, error: "Este turno ya no se puede reprogramar." });
+    }
+ 
+    const horaActualFmt = turno.hora.slice(0, 5);
+    if (fecha_nueva === turno.fecha && hora_nueva === horaActualFmt) {
+      return res.status(400).json({ success: false, error: "Elegí una fecha u horario distinto al actual." });
+    }
+ 
+    const { data: user, error: userError } = await supabase.from("usuarios")
+      .select("horarios, excepciones, capacidad_por_turno, activo, estado_suscripcion, fecha_vencimiento, email, business_name")
+      .eq("slug", slugClean).maybeSingle();
+    if (userError) throw userError;
+    if (!user || !isActivo(user.activo)) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+ 
+    const diasRestantes  = user.fecha_vencimiento ? diasHastaVencer(user.fecha_vencimiento) : null;
+    const estaSuspendido = user.estado_suscripcion === "suspendido" || (diasRestantes !== null && diasRestantes <= 0);
+    if (estaSuspendido) return res.status(403).json({ success: false, error: "Este servicio está pausado temporalmente." });
+ 
+    if (!horaDentroDeIntervalos(user.horarios, user.excepciones, fecha_nueva, hora_nueva)) {
+      return res.status(400).json({ success: false, error: "Ese día u horario no está disponible." });
+    }
+ 
+    // Chequeo de cupo "soft" (se vuelve a validar al aprobar, para
+    // evitar condiciones de carrera entre que se pide y se aprueba).
+    let capacidad = user.capacidad_por_turno || 1;
+    if (turno.servicio_id) {
+      const { data: srv } = await supabase.from("servicios").select("capacidad").eq("id", turno.servicio_id).maybeSingle();
+      if (srv?.capacidad) capacidad = srv.capacidad;
+    }
+    const { count } = await supabase.from("turnos").select("id", { count: "exact" })
+      .eq("slug", slugClean).eq("fecha", fecha_nueva).eq("hora", hora_nueva).neq("estado", "cancelado");
+    if (count >= capacidad) {
+      return res.status(400).json({ success: false, error: "Ese horario ya está lleno, elegí otro." });
+    }
+ 
+    const { data: solicitud, error: insertError } = await supabase.from("reprogramaciones").insert([{
+      turno_id, slug: slugClean,
+      fecha_actual: turno.fecha, hora_actual: horaActualFmt,
+      fecha_propuesta: fecha_nueva, hora_propuesta: hora_nueva,
+      estado: "pendiente",
+    }]).select().single();
+ 
+    if (insertError) {
+      // Viola el índice único de "1 pendiente por turno"
+      if (insertError.code === "23505") {
+        return res.status(409).json({ success: false, error: "Ya tenés una solicitud de reprogramación pendiente para este turno." });
+      }
+      throw insertError;
+    }
+ 
+    if (APPS_SCRIPT_URL && user.email) {
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST", headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action: "reprogramacionSolicitada",
+          adminEmail: user.email,
+          fechaActual: `${turno.fecha} ${horaActualFmt}`,
+          fechaPropuesta: `${fecha_nueva} ${hora_nueva}`,
+          slug: slugClean,
+          panelUrl: `${PANEL_URL}?u=${slugClean}`,
+        }),
+      }).catch((e) => console.error("Error mail reprogramación solicitada:", e.message));
+    }
+ 
+    crearNotificacion({
+      slug: slugClean,
+      tipo: "reprogramacion_solicitada",
+      titulo: "Solicitud de reprogramación",
+      mensaje: `Un cliente pidió mover su turno del ${turno.fecha} ${horaActualFmt}hs al ${fecha_nueva} ${hora_nueva}hs. Revisalo en tu agenda.`,
+      data: { turno_id, solicitud_id: solicitud.id, fecha_actual: turno.fecha, fecha_propuesta: fecha_nueva },
+    });
+ 
+    res.status(201).json({ success: true, message: "Solicitud enviada. Te avisamos cuando el negocio la responda." });
+  } catch (e) {
+    console.error("Error en /reprogramar/solicitar:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo enviar la solicitud." });
+  }
+});
+ 
+ 
+// ────────────────────────────────────────────────────────────────
+// BLOQUE 4 — Rutas de admin. Van junto a las otras rutas de
+// /admin/turnos-pendientes (mismo bloque temático), antes de
+// "TURNOS — ACTUALIZAR ESTADO (admin)".
+// ────────────────────────────────────────────────────────────────
+ 
+// GET /admin/reprogramaciones/:slug — pendientes, con datos del turno
+app.get("/admin/reprogramaciones/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { data, error } = await supabase.from("reprogramaciones")
+      .select("id, turno_id, fecha_actual, hora_actual, fecha_propuesta, hora_propuesta, created_at, turnos!inner(nombre, apellido, telefono, email, servicio_nombre)")
+      .eq("slug", slug).eq("estado", "pendiente")
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+ 
+    const solicitudes = (data || []).map((s) => ({
+      id: s.id, turno_id: s.turno_id,
+      fecha_actual: s.fecha_actual, hora_actual: s.hora_actual,
+      fecha_propuesta: s.fecha_propuesta, hora_propuesta: s.hora_propuesta,
+      created_at: s.created_at,
+      cliente: {
+        nombre: s.turnos?.nombre, apellido: s.turnos?.apellido,
+        telefono: s.turnos?.telefono, email: s.turnos?.email,
+      },
+      servicio: s.turnos?.servicio_nombre,
+    }));
+ 
+    res.json({ success: true, solicitudes });
+  } catch (e) {
+    console.error("Error en /admin/reprogramaciones:", e.message);
+    res.status(500).json({ success: false, error: "Error al obtener las solicitudes." });
+  }
+});
+ 
+// PUT /admin/reprogramaciones/:id — Body: { slug, accion: "aprobar" | "rechazar" }
+app.put("/admin/reprogramaciones/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body?.slug || req.auth?.slug || "");
+    const { accion } = req.body;
+ 
+    if (!["aprobar", "rechazar"].includes(accion)) {
+      return res.status(400).json({ success: false, error: "Acción inválida." });
+    }
+ 
+    const { data: solicitud, error: fetchError } = await supabase.from("reprogramaciones")
+      .select("*, turnos!inner(id, nombre, telefono, email, servicio_nombre, servicio_id)")
+      .eq("id", id).eq("slug", slugClean).eq("estado", "pendiente").maybeSingle();
+    if (fetchError) throw fetchError;
+    if (!solicitud) return res.status(404).json({ success: false, error: "Solicitud no encontrada o ya resuelta." });
+ 
+    const turno = solicitud.turnos;
+ 
+    if (accion === "rechazar") {
+      await supabase.from("reprogramaciones")
+        .update({ estado: "rechazada", resuelto_at: new Date().toISOString() })
+        .eq("id", id);
+ 
+      if (APPS_SCRIPT_URL && turno.email) {
+        fetch(APPS_SCRIPT_URL, {
+          method: "POST", headers: { "Content-Type": "text/plain" },
+          body: JSON.stringify({
+            action: "reprogramacionRechazada",
+            emailCliente: turno.email,
+            nombreCliente: turno.nombre,
+            fechaActual: `${solicitud.fecha_actual} ${solicitud.hora_actual}`,
+            slug: slugClean,
+          }),
+        }).catch((e) => console.error("Error mail reprogramación rechazada:", e.message));
+      }
+      if (WHATSAPP_TEMPLATE_REPROG_RECHAZADA) {
+        enviarWhatsapp(turno.telefono, WHATSAPP_TEMPLATE_REPROG_RECHAZADA, [
+          { type: "body", parameters: [
+            { type: "text", text: (turno.nombre || "Cliente").slice(0, 60) },
+            { type: "text", text: `${solicitud.fecha_actual} ${solicitud.hora_actual}` },
+          ]},
+        ]).catch((e) => console.error("Error whatsapp reprogramación rechazada:", e.message));
+      }
+ 
+      return res.json({ success: true, estado: "rechazada" });
+    }
+ 
+    // accion === "aprobar" — re-chequeo de cupo (por si se llenó
+    // entre que se pidió y se está aprobando ahora).
+    let capacidad = 1;
+    const { data: userCap } = await supabase.from("usuarios").select("capacidad_por_turno").eq("slug", slugClean).maybeSingle();
+    capacidad = userCap?.capacidad_por_turno || 1;
+    if (turno.servicio_id) {
+      const { data: srv } = await supabase.from("servicios").select("capacidad").eq("id", turno.servicio_id).maybeSingle();
+      if (srv?.capacidad) capacidad = srv.capacidad;
+    }
+    const { count } = await supabase.from("turnos").select("id", { count: "exact" })
+      .eq("slug", slugClean).eq("fecha", solicitud.fecha_propuesta).eq("hora", solicitud.hora_propuesta)
+      .neq("estado", "cancelado").neq("id", turno.id);
+    if (count >= capacidad) {
+      return res.status(409).json({
+        success: false,
+        error: "Ese horario ya no está disponible (se ocupó mientras tanto). Rechazá la solicitud o coordiná otra fecha con el cliente.",
+      });
+    }
+ 
+    await supabase.from("turnos")
+      .update({ fecha: solicitud.fecha_propuesta, hora: solicitud.hora_propuesta })
+      .eq("id", turno.id);
+ 
+    await supabase.from("reprogramaciones")
+      .update({ estado: "aprobada", resuelto_at: new Date().toISOString() })
+      .eq("id", id);
+ 
+    // Se liberó el cupo original: avisar a la lista de espera de esa fecha.
+    notificarListaEspera(slugClean, solicitud.fecha_actual)
+      .catch((e) => console.error("Error notificando lista de espera:", e.message));
+ 
+    if (APPS_SCRIPT_URL && turno.email) {
+      fetch(APPS_SCRIPT_URL, {
+        method: "POST", headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({
+          action: "reprogramacionAprobada",
+          emailCliente: turno.email,
+          nombreCliente: turno.nombre,
+          fechaNueva: `${solicitud.fecha_propuesta} ${solicitud.hora_propuesta}`,
+          servicio: turno.servicio_nombre || "",
+          slug: slugClean,
+        }),
+      }).catch((e) => console.error("Error mail reprogramación aprobada:", e.message));
+    }
+    if (WHATSAPP_TEMPLATE_REPROG_APROBADA) {
+      enviarWhatsapp(turno.telefono, WHATSAPP_TEMPLATE_REPROG_APROBADA, [
+        { type: "body", parameters: [
+          { type: "text", text: (turno.nombre || "Cliente").slice(0, 60) },
+          { type: "text", text: `${solicitud.fecha_propuesta} ${solicitud.hora_propuesta}` },
+        ]},
+      ]).catch((e) => console.error("Error whatsapp reprogramación aprobada:", e.message));
+    }
+ 
+    crearNotificacion({
+      slug: slugClean,
+      tipo: "sistema",
+      titulo: "Turno reprogramado",
+      mensaje: `El turno de ${turno.nombre || "un cliente"} se movió al ${solicitud.fecha_propuesta} ${solicitud.hora_propuesta}hs.`,
+      data: { turno_id: turno.id },
+    });
+ 
+    invalidateCache(slugClean);
+    res.json({ success: true, estado: "aprobada" });
+  } catch (e) {
+    console.error("Error en PUT /admin/reprogramaciones/:id:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo procesar la solicitud." });
   }
 });
 
