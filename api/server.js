@@ -3310,7 +3310,7 @@ const montoServicio = metodo === "sena"
 const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
 
 const montoACobrar = montoServicio + montoExtras;   // ← total real: servicio + productos
-const fee = Math.max(350, Math.round(montoACobrar * 0.02));
+const fee = Math.max(300, Math.round(montoACobrar * 0.02));
 
 if (user.mp_access_token) {
   try {
