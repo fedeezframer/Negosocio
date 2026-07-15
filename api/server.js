@@ -592,10 +592,9 @@ function agruparPagos(turnos, hoyISO) {
 // ══════════════════════════════════════════════════════════════
 // HELPER: ENVIAR MAIL DE TURNO
 // ══════════════════════════════════════════════════════════════
-function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, precioTotal, montoOnline, metodoPago }) {
+function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, precioTotal, montoOnline, metodoPago, reprogramarUrl }) {
   if (!APPS_SCRIPT_URL) return;
   const panelUrl = `${PANEL_URL}?u=${slug}`;
-
   fetch(APPS_SCRIPT_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain" },
@@ -628,6 +627,7 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
         precioTotal:   precioTotal || 0,
         montoOnline:   montoOnline || 0,
         metodoPago:    metodoPago  || "none",
+        reprogramarUrl: reprogramarUrl || "",
       }),
     }).catch((e) => console.error("Error mail turno cliente:", e.message));
   }
@@ -2467,29 +2467,45 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
       .order("fecha", { ascending: true }).order("hora", { ascending: true });
     if (error) throw error;
 
+    // ── Reprogramaciones pendientes ──
+    const { data: pendientesReprog } = await supabase.from("reprogramaciones")
+      .select("turno_id, fecha_propuesta, hora_propuesta, id")
+      .eq("slug", slug).eq("estado", "pendiente");
+    const reprogPorTurno = {};
+    (pendientesReprog || []).forEach((r) => { reprogPorTurno[r.turno_id] = r; });
+
     const porFecha = {};
     (turnos || []).forEach((t) => {
       if (!porFecha[t.fecha]) porFecha[t.fecha] = [];
-porFecha[t.fecha].push({
-    id:             t.id,
-    nombre:         t.nombre,
-    apellido:       t.apellido || null,
-    hora:           t.hora.slice(0, 5),
-    servicio:       t.servicio_nombre || null,
-    precio_cobrado: t.precio_cobrado  || 0,
-    monto_pagado:   t.monto_pagado    || 0,
-    pago_estado:    t.pago_estado     || "sin_pago",
-    metodo_pago:    t.metodo_pago     || "none",
-    estado:         t.estado,
-    email:          t.email,
-    telefono:       t.telefono,
-    notas:          t.notas || null,
-    extras:         t.extras       || [],   // ← nuevo
-    monto_extras:   t.monto_extras || 0,     // ← nuevo
-});
+      porFecha[t.fecha].push({
+        id:             t.id,
+        nombre:         t.nombre,
+        apellido:       t.apellido || null,
+        hora:           t.hora.slice(0, 5),
+        servicio:       t.servicio_nombre || null,
+        precio_cobrado: t.precio_cobrado  || 0,
+        monto_pagado:   t.monto_pagado    || 0,
+        pago_estado:    t.pago_estado     || "sin_pago",
+        metodo_pago:    t.metodo_pago     || "none",
+        estado:         t.estado,
+        email:          t.email,
+        telefono:       t.telefono,
+        notas:          t.notas || null,
+        extras:         t.extras       || [],
+        monto_extras:   t.monto_extras || 0,
+        reprogramacion_pendiente: reprogPorTurno[t.id]
+          ? {
+              id:               reprogPorTurno[t.id].id,
+              fecha_propuesta:  reprogPorTurno[t.id].fecha_propuesta,
+              hora_propuesta:   reprogPorTurno[t.id].hora_propuesta,
+            }
+          : null,
+      });
     });
 
-    const dias = Object.keys(porFecha).sort().map((fecha) => ({ fecha, esHoy: fecha === hoyISO, turnos: porFecha[fecha] }));
+    const dias = Object.keys(porFecha).sort().map((fecha) => ({
+      fecha, esHoy: fecha === hoyISO, turnos: porFecha[fecha],
+    }));
     res.json({ success: true, hoy: hoyISO, dias });
   } catch (e) {
     res.status(500).json({ success: false, error: "Error al obtener la agenda." });
