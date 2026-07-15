@@ -52,6 +52,10 @@ const CBU_REGEX   = /^\d{22}$/;
 const ALIAS_REGEX = /^[a-zA-Z0-9._-]{6,30}$/;
 
 const REPROGRAMAR_URL = process.env.REPROGRAMAR_URL || "https://turnits.com/reprogramar";
+
+function armarReprogramarUrl(turnoId, gestionToken, slug) {
+  return `${REPROGRAMAR_URL}?turno_id=${turnoId}&token=${gestionToken}&slug=${slug}`;
+}
  
 function validarDatosBancarios(d) {
   if (typeof d !== "object" || d === null || Array.isArray(d)) return false;
@@ -2089,16 +2093,17 @@ const { data: turno, error: turnoError } = await supabase.from("turnos").insert(
     if (turnoError) throw turnoError;
     
     enviarMailTurno({
-      adminEmail:    user.email,
-      emailCliente:  emailClean || "",
-      nombreCliente: name.trim(),
-      fechaHora:     `${fecha} ${hora}`,
-      slug:          slugClean,
-      servicio:      servicioNombre || "",
-      precioTotal:   precioCobrado,
-      montoOnline:   0,
-      metodoPago:    user.metodo_pago || "none",
-    });
+  adminEmail:    user.email,
+  emailCliente:  emailClean || "",
+  nombreCliente: name.trim(),
+  fechaHora:     `${fecha} ${hora}`,
+  slug:          slugClean,
+  servicio:      servicioNombre || "",
+  precioTotal:   precioCobrado,
+  montoOnline:   0,
+  metodoPago:    user.metodo_pago || "none",
+  reprogramarUrl: armarReprogramarUrl(turno.id, turno.gestion_token, slugClean), 
+});
 
     enviarWhatsappTurno({
       telefono:      phoneClean,
@@ -2369,10 +2374,10 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "Las notas son demasiado largas." });
     }
 
-    const { data: turnoExistente, error: fetchError } = await supabase
-      .from("turnos")
-      .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, metodo_pago, pago_estado, precio_cobrado")
-      .eq("id", id).eq("slug", slugClean).maybeSingle();
+   const { data: turnoExistente, error: fetchError } = await supabase
+  .from("turnos")
+  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, metodo_pago, pago_estado, precio_cobrado, gestion_token")
+  .eq("id", id).eq("slug", slugClean).maybeSingle();
 
     if (fetchError) throw fetchError;
     if (!turnoExistente) return res.status(404).json({ success: false, error: "Turno no encontrado." });
@@ -2415,21 +2420,22 @@ if (esAprobacionManual) {
     // Avisar al cliente que su turno (transferencia/efectivo) fue aprobado.
     if (esAprobacionManual) {
       if (turnoExistente.email && APPS_SCRIPT_URL) {
-        fetch(APPS_SCRIPT_URL, {
-          method: "POST", headers: { "Content-Type": "text/plain" },
-          body: JSON.stringify({
-            action:        "newAppointmentEmailCliente",
-            nombreCliente: turnoExistente.nombre,
-            fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
-            emailCliente:  turnoExistente.email,
-            slug:          slugClean,
-            servicio:      turnoExistente.servicio_nombre || "",
-            precioTotal:   turnoExistente.precio_cobrado || 0,
-            montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
-            metodoPago:    turnoExistente.metodo_pago,
-          }),
-        }).catch((e) => console.error("Error mail aprobación turno:", e.message));
-      }
+  fetch(APPS_SCRIPT_URL, {
+    method: "POST", headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({
+      action:        "newAppointmentEmailCliente",
+      nombreCliente: turnoExistente.nombre,
+      fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
+      emailCliente:  turnoExistente.email,
+      slug:          slugClean,
+      servicio:      turnoExistente.servicio_nombre || "",
+      precioTotal:   turnoExistente.precio_cobrado || 0,
+      montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
+      metodoPago:    turnoExistente.metodo_pago,
+      reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
+    }),
+  }).catch((e) => console.error("Error mail aprobación turno:", e.message));
+}
 
       const { data: negocio } = await supabase.from("usuarios").select("business_name").eq("slug", slugClean).maybeSingle();
       enviarWhatsappTurno({
@@ -3873,7 +3879,7 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       return;
     }
 
-const { error: turnoError } = await supabase.from("turnos").insert([{
+    const { data: turnoInsertado, error: turnoError } = await supabase.from("turnos").insert([{
       slug, nombre: nombre?.trim() || "Cliente", apellido: apellido?.trim() || null,
       telefono: cleanPhone(telefono?.toString() || "0"), email: email?.trim().toLowerCase() || null,
       fecha, hora, servicio_id: servicio_id || null, servicio_nombre: servicio_nombre || null,
@@ -3884,7 +3890,7 @@ const { error: turnoError } = await supabase.from("turnos").insert([{
       porcentaje_sena: metodo_pago === "sena" ? porcSena : null,
       metodo_pago, pago_estado: pagoEstado, fecha_pago: new Date().toISOString(),
       moneda: moneda || "ARS", estado: "confirmado", payment_id: String(payment_id),
-    }]);
+    }]).select().single(); // ← agregado: necesitamos el registro insertado para el link de reprogramar
 
     if (turnoError) {
       if (turnoError.code === "23505") { console.log(`⚠️ Turno duplicado bloqueado por DB: ${payment_id}`); }
@@ -3900,6 +3906,7 @@ const { error: turnoError } = await supabase.from("turnos").insert([{
           precioTotal:   Number(precio_servicio || monto || 0),
           montoOnline:   Number(monto || 0),
           metodoPago:    metodo_pago || "mercadopago",
+          reprogramarUrl: armarReprogramarUrl(turnoInsertado.id, turnoInsertado.gestion_token, slug),
         });
       }
 
