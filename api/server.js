@@ -2452,21 +2452,23 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
     const porFecha = {};
     (turnos || []).forEach((t) => {
       if (!porFecha[t.fecha]) porFecha[t.fecha] = [];
-      porFecha[t.fecha].push({
-        id:             t.id,
-        nombre:         t.nombre,
-        apellido:       t.apellido || null,
-        hora:           t.hora.slice(0, 5),
-        servicio:       t.servicio_nombre || null,
-        precio_cobrado: t.precio_cobrado  || 0,
-        monto_pagado:   t.monto_pagado    || 0,
-        pago_estado:    t.pago_estado     || "sin_pago",
-        metodo_pago:    t.metodo_pago     || "none",
-        estado:         t.estado,
-        email:          t.email,
-        telefono:       t.telefono,
-        notas:          t.notas || null,
-      });
+porFecha[t.fecha].push({
+    id:             t.id,
+    nombre:         t.nombre,
+    apellido:       t.apellido || null,
+    hora:           t.hora.slice(0, 5),
+    servicio:       t.servicio_nombre || null,
+    precio_cobrado: t.precio_cobrado  || 0,
+    monto_pagado:   t.monto_pagado    || 0,
+    pago_estado:    t.pago_estado     || "sin_pago",
+    metodo_pago:    t.metodo_pago     || "none",
+    estado:         t.estado,
+    email:          t.email,
+    telefono:       t.telefono,
+    notas:          t.notas || null,
+    extras:         t.extras       || [],   // ← nuevo
+    monto_extras:   t.monto_extras || 0,     // ← nuevo
+});
     });
 
     const dias = Object.keys(porFecha).sort().map((fecha) => ({ fecha, esHoy: fecha === hoyISO, turnos: porFecha[fecha] }));
