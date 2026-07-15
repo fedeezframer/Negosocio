@@ -1246,14 +1246,14 @@ app.get("/negocio/:slug", async (req, res) => {
     const slug = cleanSlug(req.params.slug);
     if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
  
-    const { data: user, error } = await supabase.from("usuarios")
-      .select(
-        "slug, business_name, horarios, excepciones, duracion_turno, capacidad_por_turno, " +
-        "metodo_pago, porcentaje_sena, mp_access_token, activo, plan, estado_suscripcion, " +
-        "fecha_vencimiento, tema, logo_url, acepta_transferencia, acepta_efectivo, datos_bancarios"
-      )
-      .eq("slug", slug)
-      .maybeSingle();
+const { data: user, error } = await supabase.from("usuarios")
+  .select(
+    "slug, business_name, horarios, excepciones, duracion_turno, capacidad_por_turno, " +
+    "metodo_pago, porcentaje_sena, mp_access_token, activo, plan, estado_suscripcion, " +
+    "fecha_vencimiento, tema, logo_url, acepta_transferencia, acepta_efectivo, datos_bancarios, telefono"
+  )
+  .eq("slug", slug)
+  .maybeSingle();
  
     if (error) throw error;
     if (!user)              return res.status(404).json({ success: false, error: "Negocio no encontrado." });
@@ -1285,6 +1285,7 @@ app.get("/negocio/:slug", async (req, res) => {
       negocio: {
         slug:                user.slug,
         business_name:       user.business_name,
+        telefono:            user.telefono || null,
         horarios:            user.horarios            || {},
         excepciones:         user.excepciones         || [],
         duracion_turno:      user.duracion_turno      || 30,
