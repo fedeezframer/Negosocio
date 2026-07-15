@@ -2254,7 +2254,7 @@ app.get("/turnos/publico/:id", async (req, res) => {
     if (!id || !slug) return res.status(400).json({ success: false, error: "Faltan parámetros." });
 
     const { data: turno, error } = await supabase.from("turnos")
-      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, metodo_pago, pago_estado, estado")
+      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, metodo_pago, pago_estado, estado, extras, monto_extras")
       .eq("id", id).eq("slug", slug).maybeSingle();
 
     if (error) throw error;
@@ -2276,7 +2276,7 @@ app.get("/turnos/by-payment", async (req, res) => {
     if (!payment_id || !slug) return res.status(400).json({ success: false, error: "Faltan parámetros." });
 
     const { data: turno, error } = await supabase.from("turnos")
-      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, metodo_pago, pago_estado, estado, fecha_pago")
+      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, metodo_pago, pago_estado, estado, fecha_pago, extras, monto_extras")
       .eq("payment_id", String(payment_id)).eq("slug", cleanSlug(slug)).maybeSingle();
 
     if (error) throw error;
