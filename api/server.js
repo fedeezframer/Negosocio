@@ -3167,14 +3167,14 @@ app.put("/admin/equipo/:id", requireAuth, async (req, res) => {
   try {
     const { id }    = req.params;
     const slugClean = cleanSlug(req.body.slug || req.auth.slug);
-    const { nombre, apellido, color, rol, activo } = req.body;
+    const { nombre, apellido, color, rol, activo, foto_url } = req.body;
 
     const update = {};
     if (nombre !== undefined) {
       if (nombre.trim().length < 1 || nombre.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre inválido." });
       update.nombre = nombre.trim();
     }
-    if (apellido !== undefined) update.apellido = apellido.trim().slice(0, 80);
+    if (apellido !== undefined) update.apellido = apellido ? String(apellido).trim().slice(0, 80) : null;
     if (color !== undefined) {
       const COLORES_VALIDOS = /^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$/;
       if (!COLORES_VALIDOS.test(color)) return res.status(400).json({ success: false, error: "Color inválido." });
