@@ -562,9 +562,13 @@ function agruparPagos(turnos, hoyISO) {
 // ══════════════════════════════════════════════════════════════
 // HELPER: ENVIAR MAIL DE TURNO
 // ══════════════════════════════════════════════════════════════
-function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, profesional, precioTotal, montoOnline, metodoPago, reprogramarUrl }) {
+function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, profesional, precioTotal, montoOnline, metodoPago, reprogramarUrl, extras }) {
   if (!APPS_SCRIPT_URL) return;
   const panelUrl = `${PANEL_URL}?u=${slug}`;
+  const extrasPayload = Array.isArray(extras)
+    ? extras.map((e) => ({ nombre: e.nombre, precio: Number(e.precio) || 0 }))
+    : [];
+
   fetch(APPS_SCRIPT_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain" },
@@ -576,10 +580,11 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
       emailCliente:  emailCliente || "",
       slug,
       servicio:      servicio     || "",
-      profesional:   profesional  || "",   // ← nuevo
+      profesional:   profesional  || "",
       precioTotal:   precioTotal  || 0,
       montoOnline:   montoOnline  || 0,
       metodoPago:    metodoPago   || "none",
+      extras:        extrasPayload,   // ← nuevo
       panelUrl,
     }),
   }).catch((e) => console.error("Error mail turno admin:", e.message));
@@ -595,10 +600,11 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
         emailCliente,
         slug,
         servicio:      servicio    || "",
-        profesional:   profesional || "",   // ← nuevo
+        profesional:   profesional || "",
         precioTotal:   precioTotal || 0,
         montoOnline:   montoOnline || 0,
         metodoPago:    metodoPago  || "none",
+        extras:        extrasPayload,   // ← nuevo
         reprogramarUrl: reprogramarUrl || "",
       }),
     }).catch((e) => console.error("Error mail turno cliente:", e.message));
@@ -2148,19 +2154,20 @@ const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean,
     }]).select().single();
     if (turnoError) throw turnoError;
 
-    enviarMailTurno({
-      adminEmail:    user.email,
-      emailCliente:  emailClean || "",
-      nombreCliente: name.trim(),
-      fechaHora:     `${fecha} ${hora}`,
-      slug:          slugClean,
-      servicio:      servicioNombre || "",
-      profesional:   equipoNombre || "",   // ← nuevo
-      precioTotal:   precioCobrado,
-      montoOnline:   0,
-      metodoPago:    user.metodo_pago || "none",
-      reprogramarUrl: armarReprogramarUrl(turno.id, turno.gestion_token, slugClean),
-    });
+    jsenviarMailTurno({
+  adminEmail:    user.email,
+  emailCliente:  emailClean || "",
+  nombreCliente: name.trim(),
+  fechaHora:     `${fecha} ${hora}`,
+  slug:          slugClean,
+  servicio:      servicioNombre || "",
+  profesional:   equipoNombre || "",
+  precioTotal:   precioCobrado + montoExtras,   // ← antes faltaba montoExtras
+  montoOnline:   0,
+  metodoPago:    user.metodo_pago || "none",
+  extras:        extrasResueltos,               // ← nuevo
+  reprogramarUrl: armarReprogramarUrl(turno.id, turno.gestion_token, slugClean),
+});
 
     crearNotificacion({
       slug: slugClean,
@@ -2290,22 +2297,23 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
     if (turnoError) throw turnoError;
 
     if (APPS_SCRIPT_URL) {
-      fetch(APPS_SCRIPT_URL, {
-        method: "POST", headers: { "Content-Type": "text/plain" },
-        body: JSON.stringify({
-          action:      "turnoPendienteAprobacion",
-          adminEmail:  user.email,
-          nombreCliente: name.trim(),
-          fechaHora:   `${fecha} ${hora}`,
-          slug:        slugClean,
-          servicio:    servicioNombre || "",
-          profesional: equipoNombre || "",   // ← nuevo
-          metodoPago:  metodo_pago,
-          precioTotal: precioCobrado,
-          panelUrl:    `${PANEL_URL}?u=${slugClean}`,
-        }),
-      }).catch((e) => console.error("Error mail turno pendiente:", e.message));
-    }
+  fetch(APPS_SCRIPT_URL, {
+    method: "POST", headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({
+      action:      "turnoPendienteAprobacion",
+      adminEmail:  user.email,
+      nombreCliente: name.trim(),
+      fechaHora:   `${fecha} ${hora}`,
+      slug:        slugClean,
+      servicio:    servicioNombre || "",
+      profesional: equipoNombre || "",
+      metodoPago:  metodo_pago,
+      precioTotal: precioCobrado + montoExtras,   // ← antes faltaba montoExtras
+      extras:      extrasResueltos,                // ← nuevo
+      panelUrl:    `${PANEL_URL}?u=${slugClean}`,
+    }),
+  }).catch((e) => console.error("Error mail turno pendiente:", e.message));
+}
 
     crearNotificacion({
       slug: slugClean,
@@ -2439,7 +2447,7 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
 
   const { data: turnoExistente, error: fetchError } = await supabase
   .from("turnos")
-  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, equipo_nombre, metodo_pago, pago_estado, precio_cobrado, gestion_token")
+  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, equipo_nombre, metodo_pago, pago_estado, precio_cobrado, extras, gestion_token")  // ← agregado "extras"
   .eq("id", id).eq("slug", slugClean).maybeSingle();
 
     if (fetchError) throw fetchError;
@@ -2482,25 +2490,26 @@ if (esAprobacionManual) {
 
     // Avisar al cliente que su turno (transferencia/efectivo) fue aprobado.
     if (esAprobacionManual) {
-      if (turnoExistente.email && APPS_SCRIPT_URL) {
-  fetch(APPS_SCRIPT_URL, {
-    method: "POST", headers: { "Content-Type": "text/plain" },
-    body: JSON.stringify({
-  action:        "newAppointmentEmailCliente",
-  nombreCliente: turnoExistente.nombre,
-  fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
-  emailCliente:  turnoExistente.email,
-  slug:          slugClean,
-  servicio:      turnoExistente.servicio_nombre || "",
-  profesional:   turnoExistente.equipo_nombre || "",   // ← nuevo
-  precioTotal:   turnoExistente.precio_cobrado || 0,
-  montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
-  metodoPago:    turnoExistente.metodo_pago,
-  reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
-}),
-  }).catch((e) => console.error("Error mail aprobación turno:", e.message));
+  if (turnoExistente.email && APPS_SCRIPT_URL) {
+    fetch(APPS_SCRIPT_URL, {
+      method: "POST", headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({
+        action:        "newAppointmentEmailCliente",
+        nombreCliente: turnoExistente.nombre,
+        fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
+        emailCliente:  turnoExistente.email,
+        slug:          slugClean,
+        servicio:      turnoExistente.servicio_nombre || "",
+        profesional:   turnoExistente.equipo_nombre || "",
+        precioTotal:   turnoExistente.precio_cobrado || 0,   // ya incluye extras (se guardó así al crear el turno)
+        montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
+        metodoPago:    turnoExistente.metodo_pago,
+        extras:        turnoExistente.extras || [],   // ← nuevo
+        reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
+      }),
+    }).catch((e) => console.error("Error mail aprobación turno:", e.message));
+  }
 }
-    }
 
     invalidateCache(slugClean);
     console.log(`✅ Turno ${id} → ${estado} (${slugClean})`);
@@ -3974,19 +3983,20 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       else throw turnoError;
     } else {
       if (user?.email) {
-        enviarMailTurno({
-          adminEmail:    user.email,
-          emailCliente:  email?.trim().toLowerCase() || "",
-          nombreCliente: nombre?.trim() || "Cliente",
-          fechaHora:     `${fecha} ${hora}`,
-          slug, servicio: servicio_nombre || "",
-          profesional:   equipo_nombre || "",   // ← nuevo
-          precioTotal:   Number(precio_servicio || monto || 0),
-          montoOnline:   Number(monto || 0),
-          metodoPago:    metodo_pago || "mercadopago",
-          reprogramarUrl: armarReprogramarUrl(turnoInsertado.id, turnoInsertado.gestion_token, slug),
-        });
-      }
+  enviarMailTurno({
+    adminEmail:    user.email,
+    emailCliente:  email?.trim().toLowerCase() || "",
+    nombreCliente: nombre?.trim() || "Cliente",
+    fechaHora:     `${fecha} ${hora}`,
+    slug, servicio: servicio_nombre || "",
+    profesional:   equipo_nombre || "",
+    precioTotal:   Number(precio_servicio || 0) + Number(monto_extras || 0),   // ← antes sin extras
+    montoOnline:   Number(monto || 0),
+    metodoPago:    metodo_pago || "mercadopago",
+    extras:        extras || [],   // ← nuevo
+    reprogramarUrl: armarReprogramarUrl(turnoInsertado.id, turnoInsertado.gestion_token, slug),
+  });
+}
 
       // Notificación in-app: turno pagado (una sola, con servicio + monto)
       crearNotificacion({
