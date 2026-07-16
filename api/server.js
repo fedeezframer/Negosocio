@@ -4199,6 +4199,77 @@ app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
   }
 });
 
+app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    // Modo liviano: el BotonNotificaciones solo necesita el conteo
+    if (req.query.no_leidas === "true") {
+      const { count, error } = await supabase.from("notificaciones")
+        .select("id", { count: "exact", head: true })
+        .eq("slug", slug).eq("leida", false);
+      if (error) throw error;
+      return res.json({ success: true, no_leidas: count || 0 });
+    }
+
+    // Modo completo: el NotificacionesPanel necesita la lista + el conteo
+    const [{ data: notifs, error: errNotifs }, { count, error: errCount }] = await Promise.all([
+      supabase.from("notificaciones")
+        .select("*").eq("slug", slug)
+        .order("created_at", { ascending: false }).limit(50),
+      supabase.from("notificaciones")
+        .select("id", { count: "exact", head: true })
+        .eq("slug", slug).eq("leida", false),
+    ]);
+    if (errNotifs) throw errNotifs;
+    if (errCount) throw errCount;
+
+    res.json({ success: true, notificaciones: notifs || [], no_leidas: count || 0 });
+  } catch (e) {
+    console.error("Error en GET /notificaciones/:slug:", e.message);
+    res.status(500).json({ success: false, error: "Error al obtener las notificaciones." });
+  }
+});
+
+app.put("/notificaciones/:id/leida", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body?.slug || req.auth.slug);
+    const { error } = await supabase.from("notificaciones")
+      .update({ leida: true }).eq("id", id).eq("slug", slugClean);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo marcar como leída." });
+  }
+});
+
+app.put("/notificaciones/:slug/leer-todas", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    const { error } = await supabase.from("notificaciones")
+      .update({ leida: true }).eq("slug", slug).eq("leida", false);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudieron marcar todas como leídas." });
+  }
+});
+
+app.delete("/notificaciones/:id", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
+    const { error } = await supabase.from("notificaciones")
+      .delete().eq("id", id).eq("slug", slugClean);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo eliminar la notificación." });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // CRON — Generar tips para negocios existentes
 // Corré esto una vez por día (o por semana) para que los negocios
