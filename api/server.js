@@ -562,7 +562,7 @@ function agruparPagos(turnos, hoyISO) {
 // ══════════════════════════════════════════════════════════════
 // HELPER: ENVIAR MAIL DE TURNO
 // ══════════════════════════════════════════════════════════════
-function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, precioTotal, montoOnline, metodoPago, reprogramarUrl }) {
+function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, profesional, precioTotal, montoOnline, metodoPago, reprogramarUrl }) {
   if (!APPS_SCRIPT_URL) return;
   const panelUrl = `${PANEL_URL}?u=${slug}`;
   fetch(APPS_SCRIPT_URL, {
@@ -576,6 +576,7 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
       emailCliente:  emailCliente || "",
       slug,
       servicio:      servicio     || "",
+      profesional:   profesional  || "",   // ← nuevo
       precioTotal:   precioTotal  || 0,
       montoOnline:   montoOnline  || 0,
       metodoPago:    metodoPago   || "none",
@@ -594,6 +595,7 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
         emailCliente,
         slug,
         servicio:      servicio    || "",
+        profesional:   profesional || "",   // ← nuevo
         precioTotal:   precioTotal || 0,
         montoOnline:   montoOnline || 0,
         metodoPago:    metodoPago  || "none",
@@ -776,6 +778,20 @@ app.post("/registro/verificar", limiterAuth, limiterCodigo, async (req, res) => 
 
     await supabase.from("registros_pendientes").delete().eq("email", emailClean);
 
+    try {
+  await supabase.from("equipo").insert([{
+    slug: nuevo.slug,
+    nombre: nuevo.nombre_persona,
+    apellido: pendiente.apellido || null,
+    color: "#6366F1",
+    rol: "dueño",
+    activo: true,
+    es_dueño: true,
+  }]);
+} catch (e) {
+  console.error("No se pudo crear la fila de equipo del dueño:", e.message);
+}
+    
     if (APPS_SCRIPT_URL) {
       fetch(APPS_SCRIPT_URL, {
         method: "POST", headers: { "Content-Type": "text/plain" },
@@ -2092,44 +2108,59 @@ if (servicio_id) {
   }
 }
 
+        let equipoIdValido = null;
+    let equipoNombre   = null;
+    if (equipo_id && UUID_REGEX.test(equipo_id)) {
+      const { data: prof } = await supabase.from("equipo")
+        .select("id, nombre, apellido")
+        .eq("id", equipo_id).eq("slug", slugClean).eq("activo", true).maybeSingle();
+      if (prof) {
+        equipoIdValido = prof.id;
+        equipoNombre = `${prof.nombre}${prof.apellido ? " " + prof.apellido : ""}`;
+      }
+    }
+
 const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extra_ids);
 
     const { count } = await supabase.from("turnos").select("id", { count: "exact" })
       .eq("slug", slugClean).eq("fecha", fecha).eq("hora", hora).neq("estado", "cancelado");
     if (count >= capacidad) return res.status(400).json({ success: false, error: "Este turno ya está lleno." });
 
-const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
-  slug:            slugClean,
-  nombre:          name.trim(),
-  telefono:        phoneClean,
-  apellido:        apellido?.trim().slice(0, 80) || null,
-  email:           emailClean || null,
-  fecha,
-  hora,
-  servicio_id:     servicio_id || null,
-  servicio_nombre: servicioNombre,
-  precio_cobrado:  precioCobrado + montoExtras,   // ← total real
-  extras:          extrasResueltos,               // ← nuevo
-  monto_extras:    montoExtras,                   // ← nuevo
-  monto_pagado:    0,
-  estado:          "confirmado",
-  metodo_pago:     "none",
-  pago_estado:     "sin_pago",
-}]).select().single();
+    const { data: turno, error: turnoError } = await supabase.from("turnos").insert([{
+      slug:            slugClean,
+      nombre:          name.trim(),
+      telefono:        phoneClean,
+      apellido:        apellido?.trim().slice(0, 80) || null,
+      email:           emailClean || null,
+      fecha,
+      hora,
+      servicio_id:     servicio_id || null,
+      servicio_nombre: servicioNombre,
+      equipo_id:       equipoIdValido,   // ← nuevo
+      equipo_nombre:   equipoNombre,     // ← nuevo
+      precio_cobrado:  precioCobrado + montoExtras,
+      extras:          extrasResueltos,
+      monto_extras:    montoExtras,
+      monto_pagado:    0,
+      estado:          "confirmado",
+      metodo_pago:     "none",
+      pago_estado:     "sin_pago",
+    }]).select().single();
     if (turnoError) throw turnoError;
-    
+
     enviarMailTurno({
-  adminEmail:    user.email,
-  emailCliente:  emailClean || "",
-  nombreCliente: name.trim(),
-  fechaHora:     `${fecha} ${hora}`,
-  slug:          slugClean,
-  servicio:      servicioNombre || "",
-  precioTotal:   precioCobrado,
-  montoOnline:   0,
-  metodoPago:    user.metodo_pago || "none",
-  reprogramarUrl: armarReprogramarUrl(turno.id, turno.gestion_token, slugClean), 
-});
+      adminEmail:    user.email,
+      emailCliente:  emailClean || "",
+      nombreCliente: name.trim(),
+      fechaHora:     `${fecha} ${hora}`,
+      slug:          slugClean,
+      servicio:      servicioNombre || "",
+      profesional:   equipoNombre || "",   // ← nuevo
+      precioTotal:   precioCobrado,
+      montoOnline:   0,
+      metodoPago:    user.metodo_pago || "none",
+      reprogramarUrl: armarReprogramarUrl(turno.id, turno.gestion_token, slugClean),
+    });
 
     crearNotificacion({
       slug: slugClean,
@@ -2215,6 +2246,19 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       const { data: srv } = await supabase.from("servicios").select("nombre, capacidad, precio").eq("id", servicio_id).maybeSingle();
       if (srv) { servicioNombre = srv.nombre; capacidad = srv.capacidad || capacidad; precioCobrado = Number(srv.precio || 0); }
     }
+
+     let equipoIdValido = null;
+    let equipoNombre   = null;
+    if (equipo_id && UUID_REGEX.test(equipo_id)) {
+      const { data: prof } = await supabase.from("equipo")
+        .select("id, nombre, apellido")
+        .eq("id", equipo_id).eq("slug", slugClean).eq("activo", true).maybeSingle();
+      if (prof) {
+        equipoIdValido = prof.id;
+        equipoNombre = `${prof.nombre}${prof.apellido ? " " + prof.apellido : ""}`;
+      }
+    }
+    
     const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extraIds);
 
     const { count } = await supabase.from("turnos").select("id", { count: "exact" })
@@ -2234,9 +2278,10 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       slug: slugClean, nombre: name.trim(), apellido: apellido?.trim().slice(0, 80) || null,
       telefono: phoneClean, email: emailClean || null, fecha, hora,
       servicio_id: servicio_id || null, servicio_nombre: servicioNombre,
-      precio_cobrado: precioCobrado + montoExtras,   // ← total real
-      extras: extrasResueltos,                        // ← nuevo
-      monto_extras: montoExtras,                      // ← nuevo
+      equipo_id: equipoIdValido, equipo_nombre: equipoNombre,   // ← nuevo
+      precio_cobrado: precioCobrado + montoExtras,
+      extras: extrasResueltos,
+      monto_extras: montoExtras,
       monto_pagado: 0,
       estado: "pendiente", metodo_pago,
       pago_estado: metodo_pago === "transferencia" ? "pendiente" : "sin_pago",
@@ -2244,7 +2289,6 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
     }]).select().single();
     if (turnoError) throw turnoError;
 
-    // Mail al vendedor avisando que hay un turno para aprobar.
     if (APPS_SCRIPT_URL) {
       fetch(APPS_SCRIPT_URL, {
         method: "POST", headers: { "Content-Type": "text/plain" },
@@ -2255,6 +2299,7 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
           fechaHora:   `${fecha} ${hora}`,
           slug:        slugClean,
           servicio:    servicioNombre || "",
+          profesional: equipoNombre || "",   // ← nuevo
           metodoPago:  metodo_pago,
           precioTotal: precioCobrado,
           panelUrl:    `${PANEL_URL}?u=${slugClean}`,
@@ -2441,17 +2486,18 @@ if (esAprobacionManual) {
   fetch(APPS_SCRIPT_URL, {
     method: "POST", headers: { "Content-Type": "text/plain" },
     body: JSON.stringify({
-      action:        "newAppointmentEmailCliente",
-      nombreCliente: turnoExistente.nombre,
-      fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
-      emailCliente:  turnoExistente.email,
-      slug:          slugClean,
-      servicio:      turnoExistente.servicio_nombre || "",
-      precioTotal:   turnoExistente.precio_cobrado || 0,
-      montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
-      metodoPago:    turnoExistente.metodo_pago,
-      reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
-    }),
+  action:        "newAppointmentEmailCliente",
+  nombreCliente: turnoExistente.nombre,
+  fechaHora:     `${turnoExistente.fecha} ${turnoExistente.hora.slice(0, 5)}`,
+  emailCliente:  turnoExistente.email,
+  slug:          slugClean,
+  servicio:      turnoExistente.servicio_nombre || "",
+  profesional:   turnoExistente.equipo_nombre || "",   // ← nuevo
+  precioTotal:   turnoExistente.precio_cobrado || 0,
+  montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
+  metodoPago:    turnoExistente.metodo_pago,
+  reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
+}),
   }).catch((e) => console.error("Error mail aprobación turno:", e.message));
 }
     }
@@ -3121,7 +3167,8 @@ app.get("/admin/equipo/:slug", requireAuth, async (req, res) => {
     const { data, error } = await supabase.from("equipo")
       .select("*")
       .eq("slug", slug)
-      .order("created_at", { ascending: true });
+      .order("es_dueño", { ascending: false })
+.order("created_at", { ascending: true });
     if (error) throw error;
     res.json({ success: true, equipo: data || [] });
   } catch (e) {
@@ -3169,6 +3216,20 @@ app.put("/admin/equipo/:id", requireAuth, async (req, res) => {
     const slugClean = cleanSlug(req.body.slug || req.auth.slug);
     const { nombre, apellido, color, rol, activo, foto_url } = req.body;
 
+    const { data: actual, error: fetchError } = await supabase
+      .from("equipo").select("es_dueño").eq("id", id).eq("slug", slugClean).maybeSingle();
+    if (fetchError) throw fetchError;
+    if (!actual) return res.status(404).json({ success: false, error: "Miembro no encontrado." });
+
+    if (actual.es_dueño) {
+      if (rol !== undefined && rol !== "dueño") {
+        return res.status(400).json({ success: false, error: "No podés cambiar el rol del titular de la cuenta." });
+      }
+      if (activo !== undefined && !(activo === true || activo === "true")) {
+        return res.status(400).json({ success: false, error: "El titular de la cuenta no se puede desactivar." });
+      }
+    }
+
     const update = {};
     if (nombre !== undefined) {
       if (nombre.trim().length < 1 || nombre.trim().length > 80) return res.status(400).json({ success: false, error: "Nombre inválido." });
@@ -3180,22 +3241,25 @@ app.put("/admin/equipo/:id", requireAuth, async (req, res) => {
       if (!COLORES_VALIDOS.test(color)) return res.status(400).json({ success: false, error: "Color inválido." });
       update.color = color;
     }
-    if (rol !== undefined) {
+    if (rol !== undefined && !actual.es_dueño) {
       if (!["colaborador", "admin"].includes(rol)) return res.status(400).json({ success: false, error: "Rol inválido." });
       update.rol = rol;
     }
     if (activo !== undefined) update.activo = activo === true || activo === "true";
     if (foto_url !== undefined) update.foto_url = foto_url || null;
 
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ success: false, error: "No hay campos para actualizar." });
+    }
+
     const { data, error } = await supabase.from("equipo")
-      .update(update)
-      .eq("id", id)
-      .eq("slug", slugClean)
+      .update(update).eq("id", id).eq("slug", slugClean)
       .select().single();
 
     if (error) throw error;
     res.json({ success: true, miembro: data });
   } catch (e) {
+    console.error("Error actualizando miembro de equipo:", e.message);
     res.status(500).json({ success: false, error: "No se pudo actualizar." });
   }
 });
@@ -3205,11 +3269,13 @@ app.delete("/admin/equipo/:id", requireAuth, async (req, res) => {
     const { id }    = req.params;
     const slugClean = cleanSlug(req.body?.slug || req.query?.slug || req.auth.slug);
 
-    const { error } = await supabase.from("equipo")
-      .delete()
-      .eq("id", id)
-      .eq("slug", slugClean);
+    const { data: actual } = await supabase.from("equipo")
+      .select("es_dueño").eq("id", id).eq("slug", slugClean).maybeSingle();
+    if (actual?.es_dueño) {
+      return res.status(403).json({ success: false, error: "No podés eliminar al titular de la cuenta." });
+    }
 
+    const { error } = await supabase.from("equipo").delete().eq("id", id).eq("slug", slugClean);
     if (error) throw error;
     res.json({ success: true });
   } catch (e) {
@@ -3620,7 +3686,7 @@ app.get("/auth/reset-token-info", async (req, res) => {
 app.post("/api/create-preference", limiterBooking, async (req, res) => {
   console.log("📥 create-preference body:", JSON.stringify(req.body));
   try {
-    const { nombre, telefono, email, fecha, hora, slug, servicio_id, apellido, extra_ids } = req.body;
+    const { nombre, telefono, email, fecha, hora, slug, servicio_id, apellido, extra_ids, equipo_id } = req.body;
     const slugClean = cleanSlug(slug || "");
     if (!nombre || !telefono || !fecha || !hora || !slugClean) {
       return res.status(400).json({ success: false, error: "Faltan datos requeridos." });
@@ -3640,6 +3706,18 @@ if (servicio_id) {
   if (srv) { precioServicio = Number(srv.precio || 0); nombreServicio = srv.nombre; }
 }
 
+    let equipoIdValido = null;
+    let equipoNombre   = null;
+    if (equipo_id && UUID_REGEX.test(equipo_id)) {
+      const { data: prof } = await supabase.from("equipo")
+        .select("id, nombre, apellido")
+        .eq("id", equipo_id).eq("slug", slugClean).eq("activo", true).maybeSingle();
+      if (prof) {
+        equipoIdValido = prof.id;
+        equipoNombre = `${prof.nombre}${prof.apellido ? " " + prof.apellido : ""}`;
+      }
+    }
+
 const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extra_ids);
 
 const metodo    = user.metodo_pago || "none";
@@ -3654,17 +3732,19 @@ const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` 
 const montoACobrar = montoServicio + montoExtras;   // ← total real: servicio + productos
 const fee = Math.max(300, Math.round(montoACobrar * 0.02));
 
-if (user.mp_access_token) {
-  try {
-    const metaPendiente = {
-      slug: slugClean,
-      nombre, telefono: cleanPhone(telefono), email: email || "",
-      apellido: apellido || "", fecha, hora,
-      servicio_id: servicio_id || null, servicio_nombre: nombreServicio,
-      precio_servicio: precioServicio, metodo_pago: metodo, monto: montoACobrar,
-      extras: extrasResueltos, monto_extras: montoExtras,   // ← nuevo
-      estado: "pendiente",
-    };
+    if (user.mp_access_token) {
+      try {
+        const metaPendiente = {
+          slug: slugClean,
+          nombre, telefono: cleanPhone(telefono), email: email || "",
+          apellido: apellido || "", fecha, hora,
+          servicio_id: servicio_id || null, servicio_nombre: nombreServicio,
+          equipo_id: equipoIdValido, equipo_nombre: equipoNombre,   // ← nuevo
+          precio_servicio: precioServicio, metodo_pago: metodo, monto: montoACobrar,
+          extras: extrasResueltos, monto_extras: montoExtras,
+          estado: "pendiente",
+        };
+        
     const { data: pendiente, error: pendError } = await supabase
       .from("pagos_pendientes").insert([metaPendiente]).select("id").single();
     if (pendError) throw pendError;
@@ -3878,14 +3958,16 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       slug, nombre: nombre?.trim() || "Cliente", apellido: apellido?.trim() || null,
       telefono: cleanPhone(telefono?.toString() || "0"), email: email?.trim().toLowerCase() || null,
       fecha, hora, servicio_id: servicio_id || null, servicio_nombre: servicio_nombre || null,
-      precio_cobrado: Number(precio_servicio || 0) + Number(monto_extras || 0),  // ← total real
+      equipo_id: equipo_id || null, equipo_nombre: equipo_nombre || null,   // ← nuevo
+      precio_cobrado: Number(precio_servicio || 0) + Number(monto_extras || 0),
       monto_pagado: monto,
-      extras: extras || [],            // ← nuevo
-      monto_extras: monto_extras || 0, // ← nuevo
+      extras: extras || [],
+      monto_extras: monto_extras || 0,
       porcentaje_sena: metodo_pago === "sena" ? porcSena : null,
       metodo_pago, pago_estado: pagoEstado, fecha_pago: new Date().toISOString(),
       moneda: moneda || "ARS", estado: "confirmado", payment_id: String(payment_id),
-    }]).select().single(); // ← agregado: necesitamos el registro insertado para el link de reprogramar
+    }]).select().single();
+
 
     if (turnoError) {
       if (turnoError.code === "23505") { console.log(`⚠️ Turno duplicado bloqueado por DB: ${payment_id}`); }
@@ -3898,6 +3980,7 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
           nombreCliente: nombre?.trim() || "Cliente",
           fechaHora:     `${fecha} ${hora}`,
           slug, servicio: servicio_nombre || "",
+          profesional:   equipo_nombre || "",   // ← nuevo
           precioTotal:   Number(precio_servicio || monto || 0),
           montoOnline:   Number(monto || 0),
           metodoPago:    metodo_pago || "mercadopago",
@@ -3968,24 +4051,26 @@ app.post("/webhook/mp", async (req, res) => {
       const estado = finalPayData.status === "approved" ? "aprobado" : finalPayData.status === "pending" ? "pendiente" : "rechazado";
 
       await procesarPagoConfirmado({
-        slug,
-        nombre:           meta.nombre,
-        apellido:         meta.apellido || null,
-        telefono:         meta.telefono,
-        email:            meta.email,
-        fecha:            meta.fecha,
-        hora:             meta.hora,
-        servicio_id:      meta.servicio_id || null,
-        servicio_nombre:  meta.servicio_nombre || null,
-        monto:            Number(finalPayData.transaction_amount || meta.monto || 0),
-        moneda:           finalPayData.currency_id || "ARS",
-        metodo_pago:      meta.metodo_pago || "mercadopago",
-        precio_servicio:  meta.precio_servicio || null,
-        payment_id:       paymentId,
-        estado,
-        extras: meta.extras || [],
-        monto_extras: meta.monto_extras || 0
-      });
+  slug,
+  nombre:           meta.nombre,
+  apellido:         meta.apellido || null,
+  telefono:         meta.telefono,
+  email:            meta.email,
+  fecha:            meta.fecha,
+  hora:             meta.hora,
+  servicio_id:      meta.servicio_id || null,
+  servicio_nombre:  meta.servicio_nombre || null,
+  equipo_id:        meta.equipo_id || null,        // ← nuevo
+  equipo_nombre:    meta.equipo_nombre || null,    // ← nuevo
+  monto:            Number(finalPayData.transaction_amount || meta.monto || 0),
+  moneda:           finalPayData.currency_id || "ARS",
+  metodo_pago:      meta.metodo_pago || "mercadopago",
+  precio_servicio:  meta.precio_servicio || null,
+  payment_id:       paymentId,
+  estado,
+  extras: meta.extras || [],
+  monto_extras: meta.monto_extras || 0
+});
 
       if (pendiente) {
         await supabase.from("pagos_pendientes")
