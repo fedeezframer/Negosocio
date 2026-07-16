@@ -215,9 +215,12 @@ function validarHorarios(horarios) {
       if (!Array.isArray(config.jornada) || config.jornada.length !== 2) return false;
       if (!config.jornada.every((h) => HORA_REGEX.test(h))) return false;
       if (config.descanso !== undefined && config.descanso !== null) {
-        if (!Array.isArray(config.descanso) || config.descanso.length !== 2) return false;
-        if (!config.descanso.every((h) => HORA_REGEX.test(h))) return false;
-      }
+  const esVacio = Array.isArray(config.descanso) && config.descanso.every((h) => h == null);
+  if (!esVacio) {
+    if (!Array.isArray(config.descanso) || config.descanso.length !== 2) return false;
+    if (!config.descanso.every((h) => HORA_REGEX.test(h))) return false;
+  }
+}
     }
   }
   return true;
