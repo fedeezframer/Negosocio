@@ -2157,7 +2157,7 @@ const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean,
     }]).select().single();
     if (turnoError) throw turnoError;
 
-    jsenviarMailTurno({
+    enviarMailTurno({
   adminEmail:    user.email,
   emailCliente:  emailClean || "",
   nombreCliente: name.trim(),
@@ -3946,7 +3946,7 @@ app.get("/oauth-callback", async (req, res) => {
 // o reembolse manualmente, en vez de confirmar un turno por encima
 // de la capacidad.
 // ══════════════════════════════════════════════════════════════
-async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, monto, moneda, metodo_pago, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras }) {
+async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, equipo_id, equipo_nombre, monto, moneda, metodo_pago, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras }) {
   const { data: turnoExistente } = await supabase
     .from("turnos").select("id").eq("payment_id", String(payment_id)).maybeSingle();
   if (turnoExistente) { console.log(`⚠️ Pago ${payment_id} ya procesado, ignorando.`); return; }
