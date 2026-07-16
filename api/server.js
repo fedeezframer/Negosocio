@@ -3000,7 +3000,7 @@ app.get("/admin/equipo/:slug", requireAuth, async (req, res) => {
 
 app.post("/admin/equipo", requireAuth, async (req, res) => {
   try {
-    const { slug, nombre, apellido, color, rol } = req.body;
+    const { slug, nombre, apellido, color, rol, foto_url } = req.body;
     const slugClean = cleanSlug(slug || req.auth.slug);
 
     if (!slugClean || !nombre) {
@@ -3021,6 +3021,7 @@ app.post("/admin/equipo", requireAuth, async (req, res) => {
       apellido: apellido?.trim().slice(0, 80) || null,
       color:    colorFinal,
       rol:      rolFinal,
+      foto_url: foto_url || null,
       activo:   true,
     }]).select().single();
 
