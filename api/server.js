@@ -2044,7 +2044,7 @@ app.get("/cron/limpiar-lista-espera", requireAdminKey, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 app.post("/turnos/reservar", limiterBooking, async (req, res) => {
   try {
-    const { name, phone, email, fecha, hora, slug, servicio_id, apellido, extra_ids } = req.body;
+    const { name, phone, email, fecha, hora, slug, servicio_id, apellido, extra_ids, equipo_id } = req.body;
     const slugClean = cleanSlug(slug || "");
 
     if (!name || !phone || !fecha || !hora || !slugClean) {
@@ -2193,7 +2193,7 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
   });
 }, async (req, res) => {
   try {
-    const { name, apellido, phone, email, fecha, hora, slug, servicio_id, metodo_pago } = req.body;
+    const { name, apellido, phone, email, fecha, hora, slug, servicio_id, metodo_pago, equipo_id } = req.body;
     let extraIds = [];
     try { extraIds = JSON.parse(req.body.extra_ids || "[]"); } catch { extraIds = []; }
     const slugClean = cleanSlug(slug || "");
