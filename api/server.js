@@ -1279,6 +1279,27 @@ app.get("/extras/:servicio_id", async (req, res) => {
   }
 });
 
+// GET /equipo/:slug — profesionales activos (público, para el checkout)
+app.get("/equipo/:slug", async (req, res) => {
+  try {
+    const slug = cleanSlug(req.params.slug);
+    if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    const { data: user } = await supabase.from("usuarios").select("activo").eq("slug", slug).maybeSingle();
+    if (!user || !isActivo(user.activo)) return res.status(404).json({ success: false, error: "Negocio no encontrado." });
+
+    const { data, error } = await supabase.from("equipo")
+      .select("id, nombre, apellido, color, foto_url")
+      .eq("slug", slug).eq("activo", true)
+      .order("created_at", { ascending: true });
+    if (error) throw error;
+
+    res.json({ success: true, equipo: data || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Error al obtener el equipo." });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // SLOTS DISPONIBLES
 // GET /slots-disponibles/:slug
@@ -1367,7 +1388,27 @@ intervalosDia.forEach(([ini, fin]) => {
 app.get("/servicios/:slug", async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
+    const { equipo_id } = req.query;
     if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
+
+    // Filtrado por profesional: solo servicios vinculados a ese equipo_id
+    if (equipo_id && UUID_REGEX.test(equipo_id)) {
+      const { data: vinculos, error } = await supabase.from("servicio_equipo")
+        .select("servicio_id, servicios!inner(id, nombre, descripcion, duracion, precio, capacidad, activo, orden, slug)")
+        .eq("equipo_id", equipo_id)
+        .eq("servicios.slug", slug)
+        .eq("servicios.activo", "true");
+      if (error) throw error;
+
+      const servicios = (vinculos || [])
+        .map((v) => v.servicios)
+        .filter(Boolean)
+        .sort((a, b) => (a.orden || 0) - (b.orden || 0));
+
+      return res.json({ success: true, servicios });
+    }
+
+    // Sin filtro: comportamiento original
     const { data, error } = await supabase.from("servicios")
       .select("id, nombre, descripcion, duracion, precio, capacidad")
       .eq("slug", slug).eq("activo", "true")
@@ -1579,6 +1620,96 @@ app.delete("/admin/servicios/:id", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("Error eliminando servicio:", e.message);
     res.status(500).json({ success: false, error: "No se pudo eliminar el servicio." });
+  }
+});
+
+app.get("/admin/equipo/:id/servicios-disponibles", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const slugClean = cleanSlug(req.query.slug || req.auth.slug);
+
+    const [{ data: servicios, error: e1 }, { data: vinculos, error: e2 }] = await Promise.all([
+      supabase.from("servicios").select("id, nombre, precio, duracion, activo")
+        .eq("slug", slugClean)
+        .order("orden", { ascending: true }).order("created_at", { ascending: true }),
+      supabase.from("servicio_equipo").select("servicio_id").eq("equipo_id", id),
+    ]);
+    if (e1) throw e1;
+    if (e2) throw e2;
+
+    const vinculadosSet = new Set((vinculos || []).map((v) => v.servicio_id));
+    const resultado = (servicios || []).map((s) => ({
+      ...s, activo: isActivo(s.activo), vinculado: vinculadosSet.has(s.id),
+    }));
+
+    res.json({ success: true, servicios: resultado });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Error al obtener los servicios." });
+  }
+});
+
+// POST /admin/equipo/:id/servicios — vincular
+app.post("/admin/equipo/:id/servicios", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { servicio_id } = req.body;
+    const slugClean = cleanSlug(req.body.slug || req.auth.slug);
+    if (!servicio_id) return res.status(400).json({ success: false, error: "Falta servicio_id." });
+
+    const [{ data: miembro }, { data: servicio }] = await Promise.all([
+      supabase.from("equipo").select("id").eq("id", id).eq("slug", slugClean).maybeSingle(),
+      supabase.from("servicios").select("id").eq("id", servicio_id).eq("slug", slugClean).maybeSingle(),
+    ]);
+    if (!miembro)  return res.status(404).json({ success: false, error: "Miembro no encontrado." });
+    if (!servicio) return res.status(404).json({ success: false, error: "Servicio no encontrado." });
+
+    const { error } = await supabase.from("servicio_equipo")
+      .upsert([{ servicio_id, equipo_id: id }], { onConflict: "servicio_id,equipo_id" });
+    if (error) throw error;
+
+    res.status(201).json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo vincular el servicio." });
+  }
+});
+
+// DELETE /admin/equipo/:id/servicios/:servicio_id — desvincular
+app.delete("/admin/equipo/:id/servicios/:servicio_id", requireAuth, async (req, res) => {
+  try {
+    const { id, servicio_id } = req.params;
+    const { error } = await supabase.from("servicio_equipo")
+      .delete().eq("equipo_id", id).eq("servicio_id", servicio_id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo desvincular el servicio." });
+  }
+});
+
+app.post("/admin/equipo/upload-foto", requireAuth, (req, res, next) => {
+  upload.single("foto")(req, res, (err) => {
+    if (err) return res.status(400).json({ success: false, error: err.message });
+    next();
+  });
+}, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.body.slug || req.auth.slug);
+    if (!req.file) return res.status(400).json({ success: false, error: "No se recibió imagen." });
+
+    const ext = req.file.mimetype === "image/png" ? "png" : req.file.mimetype === "image/webp" ? "webp" : "jpg";
+    const fileName = `${slug}/${Date.now()}.${ext}`;
+
+    const { error } = await supabase.storage
+      .from("equipo")
+      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype, upsert: true });
+
+    if (error) throw error;
+
+    const { data } = supabase.storage.from("equipo").getPublicUrl(fileName);
+    res.json({ success: true, url: data.publicUrl });
+  } catch (e) {
+    console.error("Error upload foto equipo:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo subir la foto." });
   }
 });
 
@@ -3054,6 +3185,7 @@ app.put("/admin/equipo/:id", requireAuth, async (req, res) => {
       update.rol = rol;
     }
     if (activo !== undefined) update.activo = activo === true || activo === "true";
+    if (foto_url !== undefined) update.foto_url = foto_url || null;
 
     const { data, error } = await supabase.from("equipo")
       .update(update)
