@@ -2437,9 +2437,9 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "Las notas son demasiado largas." });
     }
 
-   const { data: turnoExistente, error: fetchError } = await supabase
+  const { data: turnoExistente, error: fetchError } = await supabase
   .from("turnos")
-  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, metodo_pago, pago_estado, precio_cobrado, gestion_token")
+  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, equipo_nombre, metodo_pago, pago_estado, precio_cobrado, gestion_token")
   .eq("id", id).eq("slug", slugClean).maybeSingle();
 
     if (fetchError) throw fetchError;
