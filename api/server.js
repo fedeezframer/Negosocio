@@ -3555,6 +3555,23 @@ app.put("/superadmin/negocios/:slug", requireAdminKey, async (req, res) => {
   }
 });
 
+app.delete("/superadmin/negocios/:slug", requireAdminKey, async (req, res) => {
+  const slug = cleanSlug(req.params.slug);
+  try {
+    // Borra todo lo que no tiene ON DELETE CASCADE hacia usuarios
+    await supabase.from("turnos").delete().eq("slug", slug);
+    await supabase.from("reprogramaciones").delete().eq("slug", slug);
+    await supabase.from("servicios").delete().eq("slug", slug);
+    // el resto (equipo, extras, pagos_pendientes, notificaciones,
+    // lista_espera) ya cascadea solo al borrar el usuario
+    const { error } = await supabase.from("usuarios").delete().eq("slug", slug);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 // AUTH — Recuperación de contraseña
 // ══════════════════════════════════════════════════════════════
