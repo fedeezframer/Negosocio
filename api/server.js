@@ -30,8 +30,8 @@ const CACHE_DURATION = 20_000;
 const JWT_EXPIRY     = process.env.JWT_EXPIRY || "1d";
 const API_URL        = process.env.API_URL || "https://negosocio.onrender.com";
 
-const DIAS_PRUEBA        = parseInt(process.env.DIAS_PRUEBA       || "15");
-const PRECIO_RENOVACION  = parseInt(process.env.PRECIO_RENOVACION || "19000");
+const DIAS_PRUEBA        = parseInt(process.env.DIAS_PRUEBA       || "13");
+const PRECIO_RENOVACION  = parseInt(process.env.PRECIO_RENOVACION || "21000");
 const MP_PLATFORM_TOKEN  = process.env.MP_PLATFORM_TOKEN          || "";
 // FIX-SEC: secret propio para validar la firma de los webhooks de MP.
 const MP_WEBHOOK_SECRET  = process.env.MP_WEBHOOK_SECRET          || "";
