@@ -504,6 +504,23 @@ const requireAdminKey = (req, res, next) => {
   next();
 };
 
+// ══════════════════════════════════════════════════════════════
+// MIDDLEWARE: SUPERADMIN
+// Acepta JWT de admin (login normal desde /login, tabla "admins")
+// o la x-api-key (para llamadas server-to-server / cron). Así no
+// rompemos nada de lo que ya usaba requireAdminKey directamente.
+// ══════════════════════════════════════════════════════════════
+function requireSuperadmin(req, res, next) {
+  const header = req.headers["authorization"];
+  if (header?.startsWith("Bearer ")) {
+    try {
+      const payload = jwt.verify(header.split(" ")[1], process.env.JWT_SECRET);
+      if (payload.rol === "superadmin") { req.auth = payload; return next(); }
+    } catch (e) { /* si el JWT falla o no es de superadmin, probamos con x-api-key abajo */ }
+  }
+  return requireAdminKey(req, res, next);
+}
+
 
 // ══════════════════════════════════════════════════════════════
 // HELPERS DE MÉTRICAS
@@ -965,6 +982,43 @@ app.post("/login", limiterAuth, async (req, res) => {
         success: false,
         error: `Demasiados intentos fallidos. Probá de nuevo en ${estadoBloqueo.minutosRestantes} minuto(s).`,
       });
+    }
+
+    // ── Login como ADMIN (tabla separada "admins") ──
+    if (email) {
+      const { data: admin } = await supabase.from("admins")
+        .select("id, email, password, nombre, activo")
+        .eq("email", email).maybeSingle();
+
+      if (admin) {
+        if (!admin.activo) {
+          registrarIntentoFallidoLogin(claveBloqueo);
+          return res.status(403).json({ success: false, error: "Cuenta de administrador desactivada." });
+        }
+        const passwordOk = await bcrypt.compare(String(password), admin.password);
+        if (!passwordOk) {
+          registrarIntentoFallidoLogin(claveBloqueo);
+          return res.status(401).json({ success: false, error: "Credenciales incorrectas." });
+        }
+        limpiarIntentosLogin(claveBloqueo);
+
+        const secret = process.env.JWT_SECRET;
+        if (!secret) return res.status(500).json({ success: false, error: "JWT_SECRET no configurado." });
+
+        const token = jwt.sign(
+          { adminId: admin.id, email: admin.email, rol: "superadmin" },
+          secret, { expiresIn: JWT_EXPIRY }
+        );
+
+        return res.json({
+          success:  true,
+          token,
+          es_admin: true,
+          nombre:   admin.nombre || "Admin",
+          email:    admin.email,
+          redirect: "internal",
+        });
+      }
     }
 
     let query = supabase.from("usuarios")
@@ -2145,8 +2199,8 @@ const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean,
       hora,
       servicio_id:     servicio_id || null,
       servicio_nombre: servicioNombre,
-      equipo_id:       equipoIdValido,   // ← nuevo
-      equipo_nombre:   equipoNombre,     // ← nuevo
+      equipo_id:       equipoIdValido,
+      equipo_nombre:   equipoNombre,
       precio_cobrado:  precioCobrado + montoExtras,
       extras:          extrasResueltos,
       monto_extras:    montoExtras,
@@ -2157,6 +2211,9 @@ const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean,
     }]).select().single();
     if (turnoError) throw turnoError;
 
+    // FIX BUG: era "jsenviarMailTurno" (typo, función inexistente),
+    // por eso toda reserva sin pago tiraba 500 después de crear el
+    // turno en la DB. Corregido a "enviarMailTurno".
     enviarMailTurno({
   adminEmail:    user.email,
   emailCliente:  emailClean || "",
@@ -2288,7 +2345,7 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       slug: slugClean, nombre: name.trim(), apellido: apellido?.trim().slice(0, 80) || null,
       telefono: phoneClean, email: emailClean || null, fecha, hora,
       servicio_id: servicio_id || null, servicio_nombre: servicioNombre,
-      equipo_id: equipoIdValido, equipo_nombre: equipoNombre,   // ← nuevo
+      equipo_id: equipoIdValido, equipo_nombre: equipoNombre,
       precio_cobrado: precioCobrado + montoExtras,
       extras: extrasResueltos,
       monto_extras: montoExtras,
@@ -2311,8 +2368,8 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       servicio:    servicioNombre || "",
       profesional: equipoNombre || "",
       metodoPago:  metodo_pago,
-      precioTotal: precioCobrado + montoExtras,   // ← antes faltaba montoExtras
-      extras:      extrasResueltos,                // ← nuevo
+      precioTotal: precioCobrado + montoExtras,
+      extras:      extrasResueltos,
       panelUrl:    `${PANEL_URL}?u=${slugClean}`,
     }),
   }).catch((e) => console.error("Error mail turno pendiente:", e.message));
@@ -2429,10 +2486,6 @@ app.get("/admin/turnos/:id/comprobante", requireAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // TURNOS — ACTUALIZAR ESTADO (admin)
 // PUT /turnos/:id
-// Incluye el efecto de "aprobar" un turno pendiente por
-// transferencia/efectivo: pasa el pago a aprobado y avisa al
-// cliente por mail + WhatsApp. Rechazar sigue el flujo normal:
-// estado="cancelado", libera cupo y avisa a la lista de espera.
 // ══════════════════════════════════════════════════════════════
 app.put("/turnos/:id", requireAuth, async (req, res) => {
   try {
@@ -2450,7 +2503,7 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
 
   const { data: turnoExistente, error: fetchError } = await supabase
   .from("turnos")
-  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, equipo_nombre, metodo_pago, pago_estado, precio_cobrado, extras, gestion_token")  // ← agregado "extras"
+  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, equipo_nombre, metodo_pago, pago_estado, precio_cobrado, extras, gestion_token")
   .eq("id", id).eq("slug", slugClean).maybeSingle();
 
     if (fetchError) throw fetchError;
@@ -2504,10 +2557,10 @@ if (esAprobacionManual) {
         slug:          slugClean,
         servicio:      turnoExistente.servicio_nombre || "",
         profesional:   turnoExistente.equipo_nombre || "",
-        precioTotal:   turnoExistente.precio_cobrado || 0,   // ya incluye extras (se guardó así al crear el turno)
+        precioTotal:   turnoExistente.precio_cobrado || 0,
         montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
         metodoPago:    turnoExistente.metodo_pago,
-        extras:        turnoExistente.extras || [],   // ← nuevo
+        extras:        turnoExistente.extras || [],
         reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
       }),
     }).catch((e) => console.error("Error mail aprobación turno:", e.message));
@@ -2638,9 +2691,6 @@ app.get("/settings/:slug", requireAuth, async (req, res) => {
   }
 });
 
-// FIX-SEC: se valida la forma de horarios/excepciones antes de guardar
-// (ver validarHorarios / validarExcepciones), y se acotan largos de
-// texto libre (business_name, nombre_persona, apellido).
 app.put("/settings/:slug", requireAuth, async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
@@ -2833,8 +2883,6 @@ app.post("/reprogramar/solicitar", limiterBooking, async (req, res) => {
       return res.status(400).json({ success: false, error: "Ese día u horario no está disponible." });
     }
  
-    // Chequeo de cupo "soft" (se vuelve a validar al aprobar, para
-    // evitar condiciones de carrera entre que se pide y se aprueba).
     let capacidad = user.capacidad_por_turno || 1;
     if (turno.servicio_id) {
       const { data: srv } = await supabase.from("servicios").select("capacidad").eq("id", turno.servicio_id).maybeSingle();
@@ -2854,7 +2902,6 @@ app.post("/reprogramar/solicitar", limiterBooking, async (req, res) => {
     }]).select().single();
  
     if (insertError) {
-      // Viola el índice único de "1 pendiente por turno"
       if (insertError.code === "23505") {
         return res.status(409).json({ success: false, error: "Ya tenés una solicitud de reprogramación pendiente para este turno." });
       }
@@ -2892,12 +2939,9 @@ app.post("/reprogramar/solicitar", limiterBooking, async (req, res) => {
  
  
 // ────────────────────────────────────────────────────────────────
-// BLOQUE 4 — Rutas de admin. Van junto a las otras rutas de
-// /admin/turnos-pendientes (mismo bloque temático), antes de
-// "TURNOS — ACTUALIZAR ESTADO (admin)".
+// BLOQUE 4 — Rutas de admin de reprogramaciones
 // ────────────────────────────────────────────────────────────────
  
-// GET /admin/reprogramaciones/:slug — pendientes, con datos del turno
 app.get("/admin/reprogramaciones/:slug", requireAuth, async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
@@ -2926,7 +2970,6 @@ app.get("/admin/reprogramaciones/:slug", requireAuth, async (req, res) => {
   }
 });
  
-// PUT /admin/reprogramaciones/:id — Body: { slug, accion: "aprobar" | "rechazar" }
 app.put("/admin/reprogramaciones/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2966,8 +3009,6 @@ app.put("/admin/reprogramaciones/:id", requireAuth, async (req, res) => {
       return res.json({ success: true, estado: "rechazada" });
     }
  
-    // accion === "aprobar" — re-chequeo de cupo (por si se llenó
-    // entre que se pidió y se está aprobando ahora).
     let capacidad = 1;
     const { data: userCap } = await supabase.from("usuarios").select("capacidad_por_turno").eq("slug", slugClean).maybeSingle();
     capacidad = userCap?.capacidad_por_turno || 1;
@@ -2993,7 +3034,6 @@ app.put("/admin/reprogramaciones/:id", requireAuth, async (req, res) => {
       .update({ estado: "aprobada", resuelto_at: new Date().toISOString() })
       .eq("id", id);
  
-    // Se liberó el cupo original: avisar a la lista de espera de esa fecha.
     notificarListaEspera(slugClean, solicitud.fecha_actual)
       .catch((e) => console.error("Error notificando lista de espera:", e.message));
  
@@ -3104,9 +3144,6 @@ app.get("/admin/tema/:slug", requireAuth, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // LOGO — Upload
 // POST /admin/logo/:slug
-// FIX-SEC: ya no se acepta SVG (era vector de XSS almacenado vía
-// <script> embebido). multer filtra por mimetype centralizadamente
-// (TIPOS_IMAGEN_PERMITIDOS). Se maneja el error de multer con 400.
 // ══════════════════════════════════════════════════════════════
 app.post("/admin/logo/:slug", requireAuth, (req, res, next) => {
   upload.single("logo")(req, res, (err) => {
@@ -3511,7 +3548,10 @@ app.post("/superadmin/negocios", requireAdminKey, async (req, res) => {
   }
 });
 
-app.get("/superadmin/negocios", requireAdminKey, async (req, res) => {
+// FIX: middleware cambiado de requireAdminKey a requireSuperadmin
+// para poder usar esta ruta también con el JWT del panel /internal,
+// no solo con la x-api-key.
+app.get("/superadmin/negocios", requireSuperadmin, async (req, res) => {
   try {
     const { data, error } = await supabase.from("usuarios")
       .select("id, slug, business_name, nombre_persona, apellido, email, telefono, activo, plan, metodo_pago, mp_access_token, estado_suscripcion, fecha_vencimiento, created_at")
@@ -3572,6 +3612,86 @@ app.delete("/superadmin/negocios/:slug", requireAdminKey, async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// SUPERADMIN — ADMINS (login separado para el panel /internal)
+// POST /superadmin/admins — crear un usuario admin. Correr una
+// sola vez por admin (o cuando sumes uno nuevo), a mano con curl,
+// protegido con la x-api-key (ADMIN_SECRET).
+// ══════════════════════════════════════════════════════════════
+app.post("/superadmin/admins", requireAdminKey, async (req, res) => {
+  try {
+    const { email, password, nombre } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, error: "Faltan email y password." });
+    if (!validateEmail(email)) return res.status(400).json({ success: false, error: "Email inválido." });
+    if (!validatePassword(password)) return res.status(400).json({ success: false, error: "Mínimo 6 caracteres." });
+
+    const hash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
+    const { data, error } = await supabase.from("admins").insert([{
+      email: email.trim().toLowerCase(), password: hash, nombre: nombre?.trim() || null,
+    }]).select("id, email, nombre").single();
+
+    if (error) {
+      if (error.code === "23505") return res.status(409).json({ success: false, error: "Ya existe un admin con ese email." });
+      throw error;
+    }
+    res.status(201).json({ success: true, admin: data });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "No se pudo crear el admin." });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// INTERNAL — Panel de administración global (todos los negocios)
+// Requiere JWT de superadmin (login por /login con cuenta de
+// "admins") o x-api-key.
+// ══════════════════════════════════════════════════════════════
+
+// GET /internal/resumen — números generales para el dashboard
+app.get("/internal/resumen", requireSuperadmin, async (req, res) => {
+  try {
+    const hoyISO = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" })).toISOString().split("T")[0];
+
+    const [{ count: totalNegocios }, { count: negociosActivos }, { count: negociosPremium },
+           { count: turnosHoy }, { data: registrosHoy }, { data: ultimosNegocios }] = await Promise.all([
+      supabase.from("usuarios").select("id", { count: "exact", head: true }),
+      supabase.from("usuarios").select("id", { count: "exact", head: true }).eq("activo", "true"),
+      supabase.from("usuarios").select("id", { count: "exact", head: true }).eq("plan", "premium"),
+      supabase.from("turnos").select("id", { count: "exact", head: true }).eq("fecha", hoyISO).neq("estado", "cancelado"),
+      supabase.from("usuarios").select("id").gte("created_at", hoyISO),
+      supabase.from("usuarios").select("slug, business_name, plan, created_at").order("created_at", { ascending: false }).limit(10),
+    ]);
+
+    res.json({
+      success: true,
+      resumen: {
+        total_negocios:   totalNegocios   || 0,
+        negocios_activos: negociosActivos || 0,
+        negocios_premium: negociosPremium || 0,
+        turnos_hoy:       turnosHoy       || 0,
+        registros_hoy:    registrosHoy?.length || 0,
+        ultimos_negocios: ultimosNegocios || [],
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Error al obtener el resumen." });
+  }
+});
+
+// GET /internal/turnos-hoy — reservas de hoy, de todos los negocios
+app.get("/internal/turnos-hoy", requireSuperadmin, async (req, res) => {
+  try {
+    const hoyISO = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" })).toISOString().split("T")[0];
+    const { data, error } = await supabase.from("turnos")
+      .select("id, slug, nombre, apellido, hora, servicio_nombre, precio_cobrado, estado, pago_estado, metodo_pago")
+      .eq("fecha", hoyISO).neq("estado", "cancelado")
+      .order("slug", { ascending: true }).order("hora", { ascending: true });
+    if (error) throw error;
+    res.json({ success: true, fecha: hoyISO, turnos: data || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, error: "Error al obtener los turnos de hoy." });
   }
 });
 
@@ -3706,11 +3826,6 @@ app.get("/auth/reset-token-info", async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // PAGOS — Mercado Pago
 // POST /api/create-preference
-// FIX: ahora se guarda un registro en pagos_pendientes con un
-// external_reference único ANTES de crear la preferencia. El webhook
-// usa ese registro para resolver el slug/datos del turno sin
-// depender únicamente de que el token de plataforma pueda leer
-// el pago del vendedor.
 // ══════════════════════════════════════════════════════════════
 app.post("/api/create-preference", limiterBooking, async (req, res) => {
   console.log("📥 create-preference body:", JSON.stringify(req.body));
@@ -3758,7 +3873,7 @@ const montoServicio = metodo === "sena"
   : precioServicio;
 const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
 
-const montoACobrar = montoServicio + montoExtras;   // ← total real: servicio + productos
+const montoACobrar = montoServicio + montoExtras;
 const fee = Math.max(300, Math.round(montoACobrar * 0.02));
 
     if (user.mp_access_token) {
@@ -3768,7 +3883,7 @@ const fee = Math.max(300, Math.round(montoACobrar * 0.02));
           nombre, telefono: cleanPhone(telefono), email: email || "",
           apellido: apellido || "", fecha, hora,
           servicio_id: servicio_id || null, servicio_nombre: nombreServicio,
-          equipo_id: equipoIdValido, equipo_nombre: equipoNombre,   // ← nuevo
+          equipo_id: equipoIdValido, equipo_nombre: equipoNombre,
           precio_servicio: precioServicio, metodo_pago: metodo, monto: montoACobrar,
           extras: extrasResueltos, monto_extras: montoExtras,
           estado: "pendiente",
@@ -3873,8 +3988,6 @@ app.post("/renovacion/checkout/:slug", async (req, res) => {
   }
 });
 
-// FIX: protegido — antes era público y cualquiera con el slug podía
-// bajar a un negocio a plan gratis. Lo usa el owner desde el panel.
 app.post("/renovacion/downgrade/:slug", requireAuth, async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
@@ -3941,11 +4054,12 @@ app.get("/oauth-callback", async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // WEBHOOKS
-// FIX (sobreventa): si el cupo está lleno, NO se inserta el turno.
-// Se loguea como conflicto y se avisa al admin para que reprograme
-// o reembolse manualmente, en vez de confirmar un turno por encima
-// de la capacidad.
 // ══════════════════════════════════════════════════════════════
+// FIX BUG: la firma de la función no traía "equipo_id" ni
+// "equipo_nombre" en la desestructuración, pero el insert de abajo
+// sí los usaba -> ReferenceError en cada pago aprobado por webhook.
+// El emisor (webhook /webhook/mp) ya mandaba ambos campos bien;
+// el problema estaba solo acá, en la función receptora.
 async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, equipo_id, equipo_nombre, monto, moneda, metodo_pago, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras }) {
   const { data: turnoExistente } = await supabase
     .from("turnos").select("id").eq("payment_id", String(payment_id)).maybeSingle();
@@ -3987,7 +4101,7 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       slug, nombre: nombre?.trim() || "Cliente", apellido: apellido?.trim() || null,
       telefono: cleanPhone(telefono?.toString() || "0"), email: email?.trim().toLowerCase() || null,
       fecha, hora, servicio_id: servicio_id || null, servicio_nombre: servicio_nombre || null,
-      equipo_id: equipo_id || null, equipo_nombre: equipo_nombre || null,   // ← nuevo
+      equipo_id: equipo_id || null, equipo_nombre: equipo_nombre || null,
       precio_cobrado: Number(precio_servicio || 0) + Number(monto_extras || 0),
       monto_pagado: monto,
       extras: extras || [],
@@ -4010,10 +4124,10 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
     fechaHora:     `${fecha} ${hora}`,
     slug, servicio: servicio_nombre || "",
     profesional:   equipo_nombre || "",
-    precioTotal:   Number(precio_servicio || 0) + Number(monto_extras || 0),   // ← antes sin extras
+    precioTotal:   Number(precio_servicio || 0) + Number(monto_extras || 0),
     montoOnline:   Number(monto || 0),
     metodoPago:    metodo_pago || "mercadopago",
-    extras:        extras || [],   // ← nuevo
+    extras:        extras || [],
     reprogramarUrl: armarReprogramarUrl(turnoInsertado.id, turnoInsertado.gestion_token, slug),
   });
 }
@@ -4033,9 +4147,6 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
   console.log(`✅ Pago procesado: ${payment_id} — slug: ${slug} — estado: ${pagoEstado}`);
 }
 
-// FIX: el webhook ahora resuelve el slug primero contra pagos_pendientes
-// (vía external_reference), que es más confiable que depender de que
-// el MP_PLATFORM_TOKEN pueda leer la metadata del pago del vendedor.
 app.post("/webhook/mp", async (req, res) => {
   const { query, body } = req;
   try {
@@ -4090,8 +4201,8 @@ app.post("/webhook/mp", async (req, res) => {
   hora:             meta.hora,
   servicio_id:      meta.servicio_id || null,
   servicio_nombre:  meta.servicio_nombre || null,
-  equipo_id:        meta.equipo_id || null,        // ← nuevo
-  equipo_nombre:    meta.equipo_nombre || null,    // ← nuevo
+  equipo_id:        meta.equipo_id || null,
+  equipo_nombre:    meta.equipo_nombre || null,
   monto:            Number(finalPayData.transaction_amount || meta.monto || 0),
   moneda:           finalPayData.currency_id || "ARS",
   metodo_pago:      meta.metodo_pago || "mercadopago",
@@ -4164,8 +4275,6 @@ app.post("/webhook/renovacion", async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // CRON — Verificación de vencimientos
-// Además de suspender/reactivar negocios, ahora genera una
-// notificación in-app cuando faltan 5 días o 1 día para vencer.
 // ══════════════════════════════════════════════════════════════
 app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
   try {
@@ -4191,7 +4300,6 @@ app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
       slugsReactivar.forEach((s) => invalidateCache(s));
     }
 
-    // Avisos in-app para negocios que están por vencer (5 días o 1 día)
     const { data: porVencer } = await supabase.from("usuarios")
       .select("slug, fecha_vencimiento").eq("activo", "true").eq("estado_suscripcion", "activo")
       .not("fecha_vencimiento", "is", null);
@@ -4224,7 +4332,6 @@ app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
     const slug = cleanSlug(req.params.slug);
     if (!slug) return res.status(400).json({ success: false, error: "Slug inválido." });
 
-    // Modo liviano: el BotonNotificaciones solo necesita el conteo
     if (req.query.no_leidas === "true") {
       const { count, error } = await supabase.from("notificaciones")
         .select("id", { count: "exact", head: true })
@@ -4233,7 +4340,6 @@ app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
       return res.json({ success: true, no_leidas: count || 0 });
     }
 
-    // Modo completo: el NotificacionesPanel necesita la lista + el conteo
     const [{ data: notifs, error: errNotifs }, { count, error: errCount }] = await Promise.all([
       supabase.from("notificaciones")
         .select("*").eq("slug", slug)
@@ -4292,8 +4398,6 @@ app.delete("/notificaciones/:id", requireAuth, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════
 // CRON — Generar tips para negocios existentes
-// Corré esto una vez por día (o por semana) para que los negocios
-// ya creados también reciban recomendaciones, no solo los nuevos.
 // ══════════════════════════════════════════════════════════════
 app.get("/cron/generar-tips", requireAdminKey, async (req, res) => {
   try {
@@ -4328,7 +4432,7 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`
   ╔═══════════════════════════════════════════════╗
-  ║   Turnits API v13.9                            ║
+  ║   Turnits API v13.10                           ║
   ║   Sin WhatsApp (no configurado todavía)        ║
   ║   Puerto: ${PORT}                              ║
   ╚═══════════════════════════════════════════════╝
