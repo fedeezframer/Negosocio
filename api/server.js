@@ -3874,7 +3874,10 @@ const montoServicio = metodo === "sena"
 const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
 
 const montoACobrar = montoServicio + montoExtras;
-const fee = Math.max(300, Math.round(montoACobrar * 0.02));
+const esPremium = user.plan === "premium";
+const fee = esPremium
+  ? 100
+  : Math.max(300, Math.round(montoACobrar * 0.02));
 
     if (user.mp_access_token) {
       try {
