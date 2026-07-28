@@ -3844,11 +3844,11 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
     const estaSuspendido = user.estado_suscripcion === "suspendido" || (diasRestantes !== null && diasRestantes <= 0);
     if (estaSuspendido) return res.status(403).json({ success: false, error: "Este servicio está pausado temporalmente." });
 
-let precioServicio = 0, nombreServicio = "Reserva";
-if (servicio_id) {
-  const { data: srv } = await supabase.from("servicios").select("nombre, precio").eq("id", servicio_id).eq("slug", slugClean).maybeSingle();
-  if (srv) { precioServicio = Number(srv.precio || 0); nombreServicio = srv.nombre; }
-}
+    let precioServicio = 0, nombreServicio = "Reserva";
+    if (servicio_id) {
+      const { data: srv } = await supabase.from("servicios").select("nombre, precio").eq("id", servicio_id).eq("slug", slugClean).maybeSingle();
+      if (srv) { precioServicio = Number(srv.precio || 0); nombreServicio = srv.nombre; }
+    }
 
     let equipoIdValido = null;
     let equipoNombre   = null;
@@ -3862,22 +3862,23 @@ if (servicio_id) {
       }
     }
 
-const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extra_ids);
+    const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extra_ids);
 
-const metodo    = user.metodo_pago || "none";
-const debePagar = metodo === "sena" || metodo === "total";
-if (!debePagar || (precioServicio <= 0 && montoExtras <= 0)) return res.json({ isFree: true });
+    const metodo    = user.metodo_pago || "none";
+    const debePagar = metodo === "sena" || metodo === "total";
+    if (!debePagar || (precioServicio <= 0 && montoExtras <= 0)) return res.json({ isFree: true });
 
-const montoServicio = metodo === "sena"
-  ? Math.round(precioServicio * (user.porcentaje_sena || 30) / 100)
-  : precioServicio;
-const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
+    // 👇 FIX: la seña se calcula sobre (servicio + extras), no solo sobre el servicio
+    const baseCalculo = precioServicio + montoExtras;
+    const montoACobrar = metodo === "sena"
+      ? Math.round(baseCalculo * (user.porcentaje_sena || 30) / 100)
+      : baseCalculo;
+    const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
 
-const montoACobrar = montoServicio + montoExtras;
-const esPremium = user.plan === "premium";
-const fee = esPremium
-  ? 100
-  : Math.max(300, Math.round(montoACobrar * 0.02));
+    const esPremium = user.plan === "premium";
+    const fee = esPremium
+      ? 100
+      : Math.max(300, Math.round(montoACobrar * 0.02));
 
     if (user.mp_access_token) {
       try {
@@ -3891,26 +3892,33 @@ const fee = esPremium
           extras: extrasResueltos, monto_extras: montoExtras,
           estado: "pendiente",
         };
-        
-    const { data: pendiente, error: pendError } = await supabase
-      .from("pagos_pendientes").insert([metaPendiente]).select("id").single();
-    if (pendError) throw pendError;
 
-    const client = new MercadoPagoConfig({ accessToken: user.mp_access_token });
-    const pref   = new Preference(client);
+        const { data: pendiente, error: pendError } = await supabase
+          .from("pagos_pendientes").insert([metaPendiente]).select("id").single();
+        if (pendError) throw pendError;
+
+        const client = new MercadoPagoConfig({ accessToken: user.mp_access_token });
+        const pref   = new Preference(client);
+
+        // 👇 FIX: un solo ítem con el monto ya prorrateado, evita que la suma
+        // de items (que es lo que MP realmente cobra) se descuadre del total
+        const nombresExtras = extrasResueltos.map((e) => e.nombre).join(", ");
+        const tituloItem = extrasResueltos.length
+          ? `${nombreServicio} + ${nombresExtras} (${conceptoPago}): ${fecha} - ${hora}hs`
+          : `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`;
 
         const items = [
-      { title: `${nombreServicio} (${conceptoPago}): ${fecha} - ${hora}hs`, unit_price: montoServicio, quantity: 1, currency_id: "ARS" },
-      ...extrasResueltos.map((e) => ({ title: e.nombre, unit_price: e.precio, quantity: 1, currency_id: "ARS" })),
-    ];
-    const prefBody = {
-      items,
-      metadata: metaPendiente,
-      external_reference: pendiente.id,
-      notification_url: `${API_URL}/webhook/mp`,
-      back_urls: { success: `${SUCCESS_URL}?slug=${slugClean}`, failure: `${ERROR_URL}?slug=${slugClean}`, pending: `${ERROR_URL}?slug=${slugClean}` },
-      auto_return: "approved",
-    };
+          { title: tituloItem, unit_price: montoACobrar, quantity: 1, currency_id: "ARS" },
+        ];
+
+        const prefBody = {
+          items,
+          metadata: metaPendiente,
+          external_reference: pendiente.id,
+          notification_url: `${API_URL}/webhook/mp`,
+          back_urls: { success: `${SUCCESS_URL}?slug=${slugClean}`, failure: `${ERROR_URL}?slug=${slugClean}`, pending: `${ERROR_URL}?slug=${slugClean}` },
+          auto_return: "approved",
+        };
         if (fee > 0) prefBody.marketplace_fee = fee;
         const response = await pref.create({ body: prefBody });
 
