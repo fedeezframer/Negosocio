@@ -582,7 +582,15 @@ function agruparPagos(turnos, hoyISO) {
 // ══════════════════════════════════════════════════════════════
 // HELPER: ENVIAR MAIL DE TURNO
 // ══════════════════════════════════════════════════════════════
-function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, profesional, precioTotal, montoOnline, metodoPago, reprogramarUrl, extras }) {
+// FIX-SEÑA: se agrega "tipoCobro" (sena | total | null), separado de
+// "metodoPago" (el canal: mercadopago | transferencia | efectivo). Antes
+// el mail decidía "seña vs total" mirando metodoPago, lo cual solo
+// funcionaba por accidente para Mercado Pago (porque ahí el canal y el
+// tipo de cobro se guardaban mezclados en el mismo campo) y nunca
+// funcionó para transferencia. Ahora ambos datos viajan por separado y
+// el template de Apps Script arma el mensaje ("seña" / "total" / "resto
+// pendiente") en base a tipoCobro, sea cual sea el canal.
+function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, slug, servicio, profesional, precioTotal, montoOnline, metodoPago, tipoCobro, reprogramarUrl, extras }) {
   if (!APPS_SCRIPT_URL) return;
   const panelUrl = `${PANEL_URL}?u=${slug}`;
   const extrasPayload = Array.isArray(extras)
@@ -604,6 +612,7 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
       precioTotal:   precioTotal  || 0,
       montoOnline:   montoOnline  || 0,
       metodoPago:    metodoPago   || "none",
+      tipoCobro:     tipoCobro    || null,
       extras:        extrasPayload,   // ← nuevo
       panelUrl,
     }),
@@ -624,6 +633,7 @@ function enviarMailTurno({ adminEmail, emailCliente, nombreCliente, fechaHora, s
         precioTotal:   precioTotal || 0,
         montoOnline:   montoOnline || 0,
         metodoPago:    metodoPago  || "none",
+        tipoCobro:     tipoCobro   || null,
         extras:        extrasPayload,   // ← nuevo
         reprogramarUrl: reprogramarUrl || "",
       }),
@@ -2328,6 +2338,18 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
     
     const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean, servicio_id || null, extraIds);
 
+    // FIX-SEÑA: el tipo de cobro (seña vs. total) es una configuración del
+    // negocio (user.metodo_pago / user.porcentaje_sena), NO algo que
+    // mande el cliente en el body — se calcula acá igual que en
+    // /api/create-preference, para que "cuánto hay que transferir" y
+    // "cuánto queda pendiente" salgan siempre del mismo lugar y no se
+    // puedan falsear desde el front. Efectivo no usa este concepto: se
+    // paga siempre el total en persona.
+    const tipoCobro = metodo_pago === "transferencia" && (user.metodo_pago === "sena" || user.metodo_pago === "total")
+      ? user.metodo_pago
+      : null;
+    const porcSenaTransferencia = user.porcentaje_sena || 30;
+
     const { count } = await supabase.from("turnos").select("id", { count: "exact" })
       .eq("slug", slugClean).eq("fecha", fecha).eq("hora", hora).neq("estado", "cancelado");
     if (count >= capacidad) return res.status(400).json({ success: false, error: "Este turno ya está lleno." });
@@ -2350,6 +2372,8 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       extras: extrasResueltos,
       monto_extras: montoExtras,
       monto_pagado: 0,
+      tipo_cobro: tipoCobro,
+      porcentaje_sena: tipoCobro === "sena" ? porcSenaTransferencia : null,
       estado: "pendiente", metodo_pago,
       pago_estado: metodo_pago === "transferencia" ? "pendiente" : "sin_pago",
       comprobante_path: comprobantePath,
@@ -2368,6 +2392,10 @@ app.post("/turnos/reservar-manual", limiterBooking, (req, res, next) => {
       servicio:    servicioNombre || "",
       profesional: equipoNombre || "",
       metodoPago:  metodo_pago,
+      tipoCobro:   tipoCobro,
+      montoEsperado: tipoCobro === "sena"
+        ? Math.round((precioCobrado + montoExtras) * porcSenaTransferencia / 100)
+        : (precioCobrado + montoExtras),
       precioTotal: precioCobrado + montoExtras,
       extras:      extrasResueltos,
       panelUrl:    `${PANEL_URL}?u=${slugClean}`,
@@ -2503,7 +2531,7 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
 
   const { data: turnoExistente, error: fetchError } = await supabase
   .from("turnos")
-  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, equipo_nombre, metodo_pago, pago_estado, precio_cobrado, extras, gestion_token")
+  .select("id, slug, estado, fecha, hora, nombre, apellido, email, telefono, servicio_nombre, equipo_nombre, metodo_pago, pago_estado, precio_cobrado, tipo_cobro, porcentaje_sena, extras, gestion_token")
   .eq("id", id).eq("slug", slugClean).maybeSingle();
 
     if (fetchError) throw fetchError;
@@ -2517,11 +2545,24 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
 
     const updateData = { estado };
     if (notas !== undefined) updateData.notas = notas;
-if (esAprobacionManual) {
-  updateData.pago_estado  = "aprobado";
-  updateData.monto_pagado = turnoExistente.precio_cobrado || 0;
-  updateData.fecha_pago   = new Date().toISOString();
-}
+
+    // FIX-SEÑA: antes se marcaba monto_pagado = precio_cobrado siempre,
+    // como si toda aprobación manual (transferencia/efectivo) implicara
+    // "pagó el total". Si el turno se creó como seña (tipo_cobro='sena',
+    // guardado en /turnos/reservar-manual), lo que se aprueba es SOLO el
+    // monto de la seña; el resto queda pendiente y así lo va a reflejar
+    // el comprobante del cliente y el panel (comparando monto_pagado
+    // contra precio_cobrado), igual que ya funciona para Mercado Pago.
+    const precioTotalTurno = turnoExistente.precio_cobrado || 0;
+    const montoAprobado = turnoExistente.tipo_cobro === "sena"
+      ? Math.round(precioTotalTurno * (turnoExistente.porcentaje_sena || 30) / 100)
+      : precioTotalTurno;
+
+    if (esAprobacionManual) {
+      updateData.pago_estado  = "aprobado";
+      updateData.monto_pagado = montoAprobado;
+      updateData.fecha_pago   = new Date().toISOString();
+    }
 
     const { data: turnoActualizado, error: updateError } = await supabase
       .from("turnos").update(updateData).eq("id", id).eq("slug", slugClean).select().single();
@@ -2557,9 +2598,10 @@ if (esAprobacionManual) {
         slug:          slugClean,
         servicio:      turnoExistente.servicio_nombre || "",
         profesional:   turnoExistente.equipo_nombre || "",
-        precioTotal:   turnoExistente.precio_cobrado || 0,
-        montoOnline:   turnoExistente.metodo_pago === "transferencia" ? (turnoExistente.precio_cobrado || 0) : 0,
+        precioTotal:   precioTotalTurno,
+        montoOnline:   turnoExistente.metodo_pago === "transferencia" ? montoAprobado : 0,
         metodoPago:    turnoExistente.metodo_pago,
+        tipoCobro:     turnoExistente.tipo_cobro || null,
         extras:        turnoExistente.extras || [],
         reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
       }),
@@ -4071,7 +4113,12 @@ app.get("/oauth-callback", async (req, res) => {
 // sí los usaba -> ReferenceError en cada pago aprobado por webhook.
 // El emisor (webhook /webhook/mp) ya mandaba ambos campos bien;
 // el problema estaba solo acá, en la función receptora.
-async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, equipo_id, equipo_nombre, monto, moneda, metodo_pago, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras }) {
+// FIX-SEÑA: el parámetro que antes se llamaba "metodo_pago" en realidad
+// venía cargando "sena" | "total" (el TIPO de cobro, no el canal). Esta
+// función solo procesa pagos de Mercado Pago, así que el canal real es
+// siempre "mercadopago"; lo que llega en tipo_cobro es lo que antes se
+// guardaba (mal) en la columna metodo_pago del turno.
+async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email, fecha, hora, servicio_id, servicio_nombre, equipo_id, equipo_nombre, monto, moneda, tipo_cobro, precio_servicio, payment_id, estado, porcentaje_sena, extras, monto_extras }) {
   const { data: turnoExistente } = await supabase
     .from("turnos").select("id").eq("payment_id", String(payment_id)).maybeSingle();
   if (turnoExistente) { console.log(`⚠️ Pago ${payment_id} ya procesado, ignorando.`); return; }
@@ -4117,8 +4164,9 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
       monto_pagado: monto,
       extras: extras || [],
       monto_extras: monto_extras || 0,
-      porcentaje_sena: metodo_pago === "sena" ? porcSena : null,
-      metodo_pago, pago_estado: pagoEstado, fecha_pago: new Date().toISOString(),
+      porcentaje_sena: tipo_cobro === "sena" ? porcSena : null,
+      tipo_cobro: tipo_cobro || null,
+      metodo_pago: "mercadopago", pago_estado: pagoEstado, fecha_pago: new Date().toISOString(),
       moneda: moneda || "ARS", estado: "confirmado", payment_id: String(payment_id),
     }]).select().single();
 
@@ -4137,7 +4185,8 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
     profesional:   equipo_nombre || "",
     precioTotal:   Number(precio_servicio || 0) + Number(monto_extras || 0),
     montoOnline:   Number(monto || 0),
-    metodoPago:    metodo_pago || "mercadopago",
+    metodoPago:    "mercadopago",
+    tipoCobro:     tipo_cobro || null,
     extras:        extras || [],
     reprogramarUrl: armarReprogramarUrl(turnoInsertado.id, turnoInsertado.gestion_token, slug),
   });
@@ -4148,7 +4197,7 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
         slug,
         tipo: "pago_aprobado",
         titulo: "Turno pagado",
-        mensaje: `${nombre?.trim() || "Cliente"} pagó ${metodo_pago === "sena" ? "la seña" : "el turno completo"} (${servicio_nombre ? servicio_nombre + " — " : ""}$${monto}) para el ${fecha} a las ${hora}hs.`,
+        mensaje: `${nombre?.trim() || "Cliente"} pagó ${tipo_cobro === "sena" ? "la seña" : "el turno completo"} (${servicio_nombre ? servicio_nombre + " — " : ""}$${monto}) para el ${fecha} a las ${hora}hs.`,
         data: { fecha, hora, monto },
       });
     }
@@ -4216,7 +4265,9 @@ app.post("/webhook/mp", async (req, res) => {
   equipo_nombre:    meta.equipo_nombre || null,
   monto:            Number(finalPayData.transaction_amount || meta.monto || 0),
   moneda:           finalPayData.currency_id || "ARS",
-  metodo_pago:      meta.metodo_pago || "mercadopago",
+  // meta.metodo_pago viene seteado por /api/create-preference como
+  // "sena" | "total" (nunca "mercadopago" en sí) -> es el tipo de cobro.
+  tipo_cobro:       meta.metodo_pago === "sena" || meta.metodo_pago === "total" ? meta.metodo_pago : null,
   precio_servicio:  meta.precio_servicio || null,
   payment_id:       paymentId,
   estado,
