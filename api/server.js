@@ -2436,13 +2436,38 @@ app.get("/turnos/publico/:id", async (req, res) => {
     if (!id || !slug) return res.status(400).json({ success: false, error: "Faltan parámetros." });
 
     const { data: turno, error } = await supabase.from("turnos")
-      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, metodo_pago, pago_estado, estado, extras, monto_extras")
+      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, tipo_cobro, metodo_pago, pago_estado, estado, extras, monto_extras")
       .eq("id", id).eq("slug", slug).maybeSingle();
 
     if (error) throw error;
     if (!turno) return res.status(404).json({ success: false, error: "Turno no encontrado." });
 
-    res.json({ success: true, turno });
+    // FIX-MONTOS: se agrega "monto_pendiente_local", calculado acá (no
+    // en el front) a partir de tipo_cobro, para que la página de
+    // comprobante nunca tenga que adivinar cuánto falta pagar en el
+    // local. Reglas:
+    //  - tipo_cobro === "sena"  → pagó la seña online, el resto (total
+    //    - pagado) se abona en el local.
+    //  - tipo_cobro === "total" → pagó todo online, no queda nada
+    //    pendiente en el local.
+    //  - tipo_cobro null (efectivo, transferencia del total sin seña
+    //    configurada, o "none")  → si pago_estado es "aprobado" (p.ej.
+    //    transferencia ya verificada) tampoco queda saldo; si no, se
+    //    debe el total en el local.
+    const precioTotal  = Number(turno.precio_cobrado || 0);
+    const montoPagado  = Number(turno.monto_pagado || 0);
+    // monto_pagado ya refleja exactamente lo capturado (seña, total
+    // online, o el total una vez aprobado un pago manual), así que el
+    // saldo pendiente en el local siempre es simplemente la resta.
+    const montoPendienteLocal = Math.max(precioTotal - montoPagado, 0);
+
+    res.json({
+      success: true,
+      turno: {
+        ...turno,
+        monto_pendiente_local: montoPendienteLocal,
+      },
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: "Error al obtener el turno." });
   }
@@ -2458,13 +2483,22 @@ app.get("/turnos/by-payment", async (req, res) => {
     if (!payment_id || !slug) return res.status(400).json({ success: false, error: "Faltan parámetros." });
 
     const { data: turno, error } = await supabase.from("turnos")
-      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, metodo_pago, pago_estado, estado, fecha_pago, extras, monto_extras")
+      .select("id, nombre, apellido, email, telefono, fecha, hora, servicio_nombre, precio_cobrado, monto_pagado, porcentaje_sena, tipo_cobro, metodo_pago, pago_estado, estado, fecha_pago, extras, monto_extras")
       .eq("payment_id", String(payment_id)).eq("slug", cleanSlug(slug)).maybeSingle();
 
     if (error) throw error;
     if (!turno) return res.status(404).json({ success: false, error: "Turno no encontrado." });
 
-    res.json({ success: true, turno });
+    // FIX-MONTOS: mismo cálculo que /turnos/publico/:id — ver comentario ahí.
+    const montoPendienteLocal = Math.max(
+      Number(turno.precio_cobrado || 0) - Number(turno.monto_pagado || 0),
+      0
+    );
+
+    res.json({
+      success: true,
+      turno: { ...turno, monto_pendiente_local: montoPendienteLocal },
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: "Error al obtener el turno." });
   }
@@ -2653,6 +2687,9 @@ app.get("/agenda/:slug", requireAuth, async (req, res) => {
         servicio:       t.servicio_nombre || null,
         precio_cobrado: t.precio_cobrado  || 0,
         monto_pagado:   t.monto_pagado    || 0,
+        monto_pendiente_local: Math.max((t.precio_cobrado || 0) - (t.monto_pagado || 0), 0),
+        tipo_cobro:     t.tipo_cobro || null,
+        porcentaje_sena: t.porcentaje_sena || null,
         pago_estado:    t.pago_estado     || "sin_pago",
         metodo_pago:    t.metodo_pago     || "none",
         estado:         t.estado,
@@ -3437,6 +3474,9 @@ app.get("/admin-stats/:slug", requireAuth, async (req, res) => {
       servicio:       t.servicio_nombre,
       precio_cobrado: t.precio_cobrado || 0,
       monto_pagado:   t.monto_pagado   || 0,
+      monto_pendiente_local: Math.max((t.precio_cobrado || 0) - (t.monto_pagado || 0), 0),
+      tipo_cobro:     t.tipo_cobro || null,
+      porcentaje_sena: t.porcentaje_sena || null,
       pago_estado:    t.pago_estado    || "sin_pago",
       metodo_pago:    t.metodo_pago    || "none",
       estado:         t.estado,
@@ -3458,6 +3498,9 @@ const turnosHoyDetalle = turnosData
         pago_estado:    t.pago_estado    || "sin_pago",
         metodo_pago:    t.metodo_pago    || "none",
         precio_cobrado: t.precio_cobrado || 0,
+        monto_pagado:   t.monto_pagado   || 0,
+        monto_pendiente_local: Math.max((t.precio_cobrado || 0) - (t.monto_pagado || 0), 0),
+        tipo_cobro:     t.tipo_cobro || null,
     }));
 
     const desde90 = new Date(ahoraArg); desde90.setDate(desde90.getDate() - 90);
