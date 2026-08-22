@@ -31,7 +31,7 @@ const CACHE_DURATION = 20_000;
 const JWT_EXPIRY     = process.env.JWT_EXPIRY || "1d";
 const API_URL        = process.env.API_URL || "https://negosocio.onrender.com";
 
-const DIAS_PRUEBA        = parseInt(process.env.DIAS_PRUEBA       || "13");
+const DIAS_PRUEBA        = parseInt(process.env.DIAS_PRUEBA       || "30");
 const PRECIO_RENOVACION  = parseInt(process.env.PRECIO_RENOVACION || "21000");
 const MP_PLATFORM_TOKEN  = process.env.MP_PLATFORM_TOKEN          || "";
 // FIX-SEC: secret propio para validar la firma de los webhooks de MP.
@@ -4158,8 +4158,12 @@ app.post("/api/create-preference", limiterBooking, async (req, res) => {
     const conceptoPago = metodo === "sena" ? `Seña ${user.porcentaje_sena || 30}%` : "Total";
 
     const esPremium = user.plan === "premium";
+    // Comisión fija para premium: distinta durante el período de
+    // prueba ($200) vs. una vez que ya pagó al menos una renovación
+    // ($150). El plan gratis no se toca: sigue en 2% con piso $300.
+    const enTrial = user.estado_suscripcion === "trial";
     const fee = esPremium
-      ? 100
+      ? (enTrial ? 250 : 150)
       : Math.max(300, Math.round(montoACobrar * 0.02));
 
     if (user.mp_access_token) {
