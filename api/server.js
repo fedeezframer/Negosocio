@@ -8,6 +8,7 @@ import jwt            from "jsonwebtoken";
 import rateLimit      from "express-rate-limit";
 import multer         from "multer";
 import crypto         from "crypto";
+import webpush        from "web-push";
 
 // ══════════════════════════════════════════════════════════════
 // CONFIGURACIÓN GLOBAL
@@ -52,6 +53,168 @@ const CBU_REGEX   = /^\d{22}$/;
 const ALIAS_REGEX = /^[a-zA-Z0-9._-]{6,30}$/;
 
 const REPROGRAMAR_URL = process.env.REPROGRAMAR_URL || "https://turnits.com/reprogramar";
+
+// ══════════════════════════════════════════════════════════════
+// WHATSAPP (Meta Cloud API)
+// Requiere WHATSAPP_TOKEN (token permanente del System User) y
+// WHATSAPP_PHONE_NUMBER_ID (de WhatsApp > Configuración de la API
+// en developers.facebook.com). Si no están seteadas, enviarWhatsapp()
+// no hace nada (no rompe el flujo, solo no manda el mensaje).
+// ══════════════════════════════════════════════════════════════
+const WHATSAPP_TOKEN           = process.env.WHATSAPP_TOKEN || "";
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || "";
+const WHATSAPP_API_VERSION     = process.env.WHATSAPP_API_VERSION || "v21.0";
+const WHATSAPP_LANG            = process.env.WHATSAPP_LANG || "es";
+// Token propio (elegido por vos) para validar el GET de verificación
+// del webhook de Meta. Solo hace falta si activás el webhook.
+const WHATSAPP_VERIFY_TOKEN    = process.env.WHATSAPP_VERIFY_TOKEN || "";
+
+if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
+  console.warn("⚠️  WhatsApp no configurado (faltan WHATSAPP_TOKEN / WHATSAPP_PHONE_NUMBER_ID). Los avisos por WhatsApp no se van a enviar.");
+}
+
+// ══════════════════════════════════════════════════════════════
+// WEB PUSH (notificaciones del navegador para el panel del negocio)
+// Se generan una sola vez con `npx web-push generate-vapid-keys`
+// y se cargan acá como env vars. VAPID_SUBJECT tiene que ser un
+// mailto: o https:// real (Meta/los navegadores lo usan para
+// contactar al dueño de las claves si algo anda mal).
+// ══════════════════════════════════════════════════════════════
+const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || "";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+const VAPID_SUBJECT     = process.env.VAPID_SUBJECT     || "mailto:soporte@turnits.com";
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn("⚠️  Web Push no configurado (faltan VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY). Las notificaciones del navegador no se van a enviar.");
+}
+
+// Mismo mapeo de íconos que ya usás en el NotificacionesPanel de Framer,
+// para que el título del push se vea consistente con el panel in-app.
+const PUSH_ICONOS_POR_TIPO = {
+  turno_nuevo:      "📅",
+  turno_cancelado:  "❌",
+  turno_pendiente:  "⏱️",
+  pago_aprobado:    "💰",
+  lista_espera:     "⏳",
+  vencimiento:      "⚠️",
+  recordatorio:     "🔔",
+  tip:              "💡",
+  sistema:          "ℹ️",
+};
+
+// ══════════════════════════════════════════════════════════════
+// enviarPush: manda una Web Push a TODOS los dispositivos que ese
+// negocio activó. Nunca bloquea el flujo principal. Si un endpoint
+// ya no es válido (404/410 → el usuario desinstaló, borró permisos,
+// cambió de navegador), se borra la suscripción vieja de la DB sola.
+// ══════════════════════════════════════════════════════════════
+async function enviarPush(slug, { titulo, mensaje, tipo = "sistema", url = null }) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  try {
+    const { data: subs, error } = await supabase.from("push_subscriptions")
+      .select("id, endpoint, p256dh, auth").eq("slug", slug);
+    if (error || !subs?.length) return;
+
+    const payload = JSON.stringify({
+      title: `${PUSH_ICONOS_POR_TIPO[tipo] || "🔔"} ${titulo}`,
+      body:  mensaje,
+      tag:   tipo,
+      url:   url || `${PANEL_URL}?u=${slug}`,
+    });
+
+    await Promise.all(subs.map(async (s) => {
+      try {
+        await webpush.sendNotification(
+          { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } },
+          payload
+        );
+      } catch (e) {
+        if (e.statusCode === 404 || e.statusCode === 410) {
+          await supabase.from("push_subscriptions").delete().eq("id", s.id);
+        } else {
+          console.error(`❌ Error enviando push a ${slug}:`, e.message);
+        }
+      }
+    }));
+  } catch (e) {
+    console.error("❌ Error en enviarPush:", e.message);
+  }
+}
+
+// Nombres de las plantillas aprobadas en Meta (WhatsApp Manager).
+// Si les cambiás el nombre allá, actualizá acá.
+const WHATSAPP_TEMPLATES = {
+  TURNO_NUEVO:         "turno_nuevo_cliente",
+  TURNO_CANCELADO:     "turno_cancelado_cliente",
+  TURNO_REPROGRAMADO:  "turno_reprogramado_cliente",
+  TURNO_RECORDATORIO:  "turno_recordatorio_cliente",
+};
+
+// FIX-AR: Meta exige el número en formato E.164 SIN el "+", y para
+// celulares argentinos hace falta el "9" después del 54 (aunque para
+// llamar/mandar SMS dentro de Argentina ya no se use). Ej: un celu
+// guardado como "3511234567" (10 dígitos, con característica) tiene
+// que viajar como "5493511234567". Si el negocio ya cargó el teléfono
+// con 54 o 549 adelante, no se duplica nada.
+function formatWhatsappAR(telefonoRaw) {
+  let t = String(telefonoRaw || "").replace(/\D/g, "");
+  if (!t) return null;
+  if (t.startsWith("00")) t = t.slice(2);
+  if (t.startsWith("54")) t = t.slice(2);
+  if (t.startsWith("9"))  t = t.slice(1);
+  if (t.startsWith("0"))  t = t.slice(1);   // 0 de larga distancia
+  if (t.startsWith("15") && t.length > 10) t = t.slice(2); // 15 viejo, solo si no rompe el largo
+  if (t.length < 8 || t.length > 11) return null; // número claramente inválido, no intentamos mandar
+  return `549${t}`;
+}
+
+// ══════════════════════════════════════════════════════════════
+// enviarWhatsapp: manda un mensaje de plantilla vía WhatsApp Cloud API.
+// Nunca bloquea el flujo principal (igual que los mails): si falla,
+// solo se loguea. `parametros` es un array de strings, en el mismo
+// orden que las variables {{1}}, {{2}}, ... de la plantilla.
+// ══════════════════════════════════════════════════════════════
+async function enviarWhatsapp(telefonoRaw, templateName, parametros = []) {
+  if (!WHATSAPP_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) return;
+  const to = formatWhatsappAR(telefonoRaw);
+  if (!to) {
+    console.warn(`⚠️  WhatsApp no enviado: teléfono inválido (${telefonoRaw})`);
+    return;
+  }
+
+  try {
+    const resp = await fetch(
+      `https://graph.facebook.com/${WHATSAPP_API_VERSION}/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to,
+          type: "template",
+          template: {
+            name: templateName,
+            language: { code: WHATSAPP_LANG },
+            components: parametros.length
+              ? [{ type: "body", parameters: parametros.map((p) => ({ type: "text", text: String(p ?? "") })) }]
+              : [],
+          },
+        }),
+      }
+    );
+    const data = await resp.json();
+    if (!resp.ok) {
+      console.error(`❌ WhatsApp (${templateName}) a ${to}:`, JSON.stringify(data.error || data));
+    }
+  } catch (e) {
+    console.error(`❌ Error enviando WhatsApp (${templateName}) a ${to}:`, e.message);
+  }
+}
 
 function armarReprogramarUrl(turnoId, gestionToken, slug) {
   return `${REPROGRAMAR_URL}?turno_id=${turnoId}&token=${gestionToken}&slug=${slug}`;
@@ -264,6 +427,7 @@ async function crearNotificacion({ slug, tipo, titulo, mensaje, data = {} }) {
   } catch (e) {
     console.error("Error creando notificación:", e.message);
   }
+  enviarPush(slug, { titulo, mensaje, tipo }).catch((e) => console.error("Error enviando push:", e.message));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2239,6 +2403,10 @@ const { extras: extrasResueltos, montoExtras } = await resolverExtras(slugClean,
   reprogramarUrl: armarReprogramarUrl(turno.id, turno.gestion_token, slugClean),
 });
 
+    enviarWhatsapp(phoneClean, WHATSAPP_TEMPLATES.TURNO_NUEVO, [
+      name.trim(), user.business_name || slugClean, fecha, hora.slice(0, 5), servicioNombre || "turno",
+    ]).catch((e) => console.error("Error WhatsApp turno nuevo:", e.message));
+
     crearNotificacion({
       slug: slugClean,
       tipo: "turno_nuevo",
@@ -2617,6 +2785,14 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
         mensaje: `Se canceló el turno de ${turnoExistente.nombre || "un cliente"} del ${turnoExistente.fecha} a las ${turnoExistente.hora?.slice(0, 5) || ""}hs.`,
         data: { turno_id: id, fecha: turnoExistente.fecha },
       });
+
+      if (turnoExistente.telefono) {
+        const { data: negocioCancel } = await supabase.from("usuarios").select("business_name").eq("slug", slugClean).maybeSingle();
+        enviarWhatsapp(turnoExistente.telefono, WHATSAPP_TEMPLATES.TURNO_CANCELADO, [
+          turnoExistente.nombre || "Cliente", negocioCancel?.business_name || slugClean,
+          turnoExistente.fecha, turnoExistente.hora?.slice(0, 5) || "",
+        ]).catch((e) => console.error("Error WhatsApp turno cancelado:", e.message));
+      }
     }
 
     // Avisar al cliente que su turno (transferencia/efectivo) fue aprobado.
@@ -2640,6 +2816,13 @@ app.put("/turnos/:id", requireAuth, async (req, res) => {
         reprogramarUrl: armarReprogramarUrl(turnoExistente.id, turnoExistente.gestion_token, slugClean),
       }),
     }).catch((e) => console.error("Error mail aprobación turno:", e.message));
+  }
+  if (turnoExistente.telefono) {
+    const { data: negocioAprob } = await supabase.from("usuarios").select("business_name").eq("slug", slugClean).maybeSingle();
+    enviarWhatsapp(turnoExistente.telefono, WHATSAPP_TEMPLATES.TURNO_NUEVO, [
+      turnoExistente.nombre || "Cliente", negocioAprob?.business_name || slugClean,
+      turnoExistente.fecha, turnoExistente.hora?.slice(0, 5) || "", turnoExistente.servicio_nombre || "turno",
+    ]).catch((e) => console.error("Error WhatsApp aprobación turno:", e.message));
   }
 }
 
@@ -3084,7 +3267,13 @@ app.put("/admin/reprogramaciones/:id", requireAuth, async (req, res) => {
           }),
         }).catch((e) => console.error("Error mail reprogramación rechazada:", e.message));
       }
- 
+
+      // Nota: el rechazo de una solicitud de reprogramación no dispara
+      // WhatsApp porque no encaja con ninguna de las 4 plantillas (no es
+      // "cancelado" ni "reprogramado", el turno original sigue en pie).
+      // Si querés cubrirlo, se puede sumar una 5ta plantilla tipo
+      // "turno_reprogramacion_rechazada_cliente" y engancharla acá.
+
       return res.json({ success: true, estado: "rechazada" });
     }
  
@@ -3128,6 +3317,14 @@ app.put("/admin/reprogramaciones/:id", requireAuth, async (req, res) => {
           slug: slugClean,
         }),
       }).catch((e) => console.error("Error mail reprogramación aprobada:", e.message));
+    }
+
+    if (turno.telefono) {
+      const { data: negocioReprog } = await supabase.from("usuarios").select("business_name").eq("slug", slugClean).maybeSingle();
+      enviarWhatsapp(turno.telefono, WHATSAPP_TEMPLATES.TURNO_REPROGRAMADO, [
+        turno.nombre || "Cliente", negocioReprog?.business_name || slugClean,
+        solicitud.fecha_propuesta, solicitud.hora_propuesta?.slice(0, 5) || "",
+      ]).catch((e) => console.error("Error WhatsApp reprogramación aprobada:", e.message));
     }
  
     crearNotificacion({
@@ -4235,6 +4432,10 @@ async function procesarPagoConfirmado({ slug, nombre, apellido, telefono, email,
   });
 }
 
+      enviarWhatsapp(telefono, WHATSAPP_TEMPLATES.TURNO_NUEVO, [
+        nombre?.trim() || "Cliente", user?.business_name || slug, fecha, hora.slice(0, 5), servicio_nombre || "turno",
+      ]).catch((e) => console.error("Error WhatsApp turno nuevo (pago):", e.message));
+
       // Notificación in-app: turno pagado (una sola, con servicio + monto)
       crearNotificacion({
         slug,
@@ -4432,6 +4633,107 @@ app.get("/cron/check-vencimientos", requireAdminKey, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════
+// CRON — Recordatorios de turno por WhatsApp (turnos de mañana)
+// Pensado para llamarse 1 vez por día (ej: 18:00hs ARG) desde un
+// cron job externo (Render Cron Job / cron-job.org) apuntando acá
+// con el header/query de admin key. Manda el recordatorio a los
+// turnos confirmados o pendientes del día siguiente que todavía
+// no lo recibieron (columna recordatorio_enviado).
+// ══════════════════════════════════════════════════════════════
+app.get("/cron/recordatorios-turno", requireAdminKey, async (req, res) => {
+  try {
+    const hoyArg = new Date().toLocaleString("en-US", { timeZone: "America/Argentina/Buenos_Aires" });
+    const mañana = new Date(hoyArg);
+    mañana.setDate(mañana.getDate() + 1);
+    const fechaObjetivo = mañana.toISOString().split("T")[0];
+
+    const { data: turnos, error } = await supabase.from("turnos")
+      .select("id, slug, nombre, telefono, fecha, hora, servicio_nombre")
+      .eq("fecha", fechaObjetivo)
+      .in("estado", ["confirmado", "pendiente"])
+      .eq("recordatorio_enviado", false)
+      .not("telefono", "is", null);
+    if (error) throw error;
+
+    if (!turnos?.length) {
+      return res.json({ success: true, fecha: fechaObjetivo, enviados: 0 });
+    }
+
+    const slugsUnicos = [...new Set(turnos.map((t) => t.slug))];
+    const { data: negocios } = await supabase.from("usuarios")
+      .select("slug, business_name").in("slug", slugsUnicos);
+    const nombreNegocio = Object.fromEntries((negocios || []).map((n) => [n.slug, n.business_name]));
+
+    let enviados = 0;
+    for (const t of turnos) {
+      await enviarWhatsapp(t.telefono, WHATSAPP_TEMPLATES.TURNO_RECORDATORIO, [
+        t.nombre || "Cliente", t.fecha, t.hora?.slice(0, 5) || "",
+        nombreNegocio[t.slug] || t.slug, t.servicio_nombre || "turno",
+      ]);
+      await supabase.from("turnos").update({ recordatorio_enviado: true }).eq("id", t.id);
+      enviados++;
+    }
+
+    res.json({ success: true, fecha: fechaObjetivo, enviados });
+  } catch (e) {
+    console.error("Error en /cron/recordatorios-turno:", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// WEB PUSH — endpoints para el panel (componente de Framer)
+// ══════════════════════════════════════════════════════════════
+
+// El panel pide la clave pública para poder suscribirse (PushManager.subscribe
+// necesita la applicationServerKey en formato Uint8Array derivado de esto).
+app.get("/push/vapid-public-key", (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(503).json({ success: false, error: "Web Push no configurado." });
+  res.json({ success: true, publicKey: VAPID_PUBLIC_KEY });
+});
+
+// Guarda (o actualiza, si el mismo endpoint ya existía) la suscripción
+// que devuelve PushManager.subscribe() en el navegador del dueño.
+app.post("/push/subscribe", requireAuth, async (req, res) => {
+  try {
+    const slug = cleanSlug(req.body?.slug || req.auth?.slug || "");
+    const { subscription } = req.body;
+    if (!slug) return res.status(400).json({ success: false, error: "Falta el slug." });
+    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+      return res.status(400).json({ success: false, error: "Suscripción inválida." });
+    }
+
+    const { error } = await supabase.from("push_subscriptions").upsert([{
+      slug,
+      endpoint: subscription.endpoint,
+      p256dh:   subscription.keys.p256dh,
+      auth:     subscription.keys.auth,
+    }], { onConflict: "endpoint" });
+    if (error) throw error;
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Error en /push/subscribe:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo guardar la suscripción." });
+  }
+});
+
+// El panel la llama cuando el usuario desactiva las notificaciones
+// desde la UI (o antes de re-suscribirse, para limpiar duplicados).
+app.delete("/push/subscribe", requireAuth, async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    if (!endpoint) return res.status(400).json({ success: false, error: "Falta el endpoint." });
+    const { error } = await supabase.from("push_subscriptions").delete().eq("endpoint", endpoint);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    console.error("Error en DELETE /push/subscribe:", e.message);
+    res.status(500).json({ success: false, error: "No se pudo eliminar la suscripción." });
+  }
+});
+
 app.get("/notificaciones/:slug", requireAuth, async (req, res) => {
   try {
     const slug = cleanSlug(req.params.slug);
@@ -4534,11 +4836,14 @@ app.use((err, req, res, _next) => {
 // ARRANQUE
 // ══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 10000;
+const whatsappOk = !!(WHATSAPP_TOKEN && WHATSAPP_PHONE_NUMBER_ID);
+const webpushOk  = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
 app.listen(PORT, () => {
   console.log(`
   ╔═══════════════════════════════════════════════╗
-  ║   Turnits API v13.10                           ║
-  ║   Sin WhatsApp (no configurado todavía)        ║
+  ║   Turnits API v13.12                           ║
+  ║   WhatsApp:  ${whatsappOk ? "✅ configurado" : "❌ sin configurar"}           ║
+  ║   Web Push:  ${webpushOk  ? "✅ configurado" : "❌ sin configurar"}           ║
   ║   Puerto: ${PORT}                              ║
   ╚═══════════════════════════════════════════════╝
   `);
